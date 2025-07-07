@@ -1679,7 +1679,7 @@ def lead_generation_page():
         leads_per_query = st.selectbox(
             "Leads per search query",
             options=[20, 25, 50, 100],
-            index=3,  # Default to 20
+            index=0,  # Default to 20
             help="Number of LinkedIn profiles to fetch per search query. More leads = longer processing time."
         )
         st.session_state["leads_per_query"] = leads_per_query
@@ -1794,14 +1794,14 @@ def lead_generation_page():
         
         st.subheader("🔍 Direct Lead Search")
         st.markdown("""
-        Specify your search criteria to generate leads directly from Apollo.io:
+        Specify your search criteria to generate leads:
         
         1. Select job titles, locations, and industries from the dropdown menus
         2. Add custom values if needed
         3. Choose company size ranges
         4. Click 'Generate Leads' to start the search
         
-        Each search will retrieve up to 25 leads. For best results, use specific locations and job titles.
+        Each search will retrieve up to 100 leads as set on the sidebar. For best results, use specific locations and job titles.
         """)
         
         with st.form("direct_lead_search_form"):
