@@ -1680,7 +1680,7 @@ def lead_generation_page():
         leads_per_query = st.selectbox(
             "Leads per search query",
             options=[20, 25, 50, 100],
-            index=0,  # Default to 20
+            index=3,  # Default to 20
             help="Number of LinkedIn profiles to fetch per search query. More leads = longer processing time."
         )
         st.session_state["leads_per_query"] = leads_per_query
