@@ -22,6 +22,994 @@ import hashlib
 
 from collections import deque
 
+import pandas as pd
+import plotly.express as px
+import plotly.graph_objects as go
+from datetime import datetime, timedelta
+import sqlite3
+import json
+from typing import Dict, List, Any, Optional
+
+
+def email_dashboard_page():
+    """Email dashboard page showing email tracking metrics and events"""
+    st.title("📊 Email Analytics Dashboard")
+    
+    # Initialize the email tracking database
+    db = EmailTrackingDB()
+    
+    # Create tabs for different sections
+    overview_tab, emails_tab, events_tab, webhook_tab = st.tabs([
+        "📈 Overview", "📧 Emails", "🔔 Events", "🔌 Webhook"
+    ])
+    
+    with overview_tab:
+        display_overview(db)
+    
+    with emails_tab:
+        display_emails(db)
+    
+    with events_tab:
+        display_events(db)
+    
+    with webhook_tab:
+        webhook_endpoint()
+
+def display_overview(db):
+    """Display overview metrics and charts"""
+    st.header("Email Campaign Overview")
+    
+    # Get email stats
+    stats = db.get_email_stats()
+    
+    # Create metrics row
+    col1, col2, col3, col4 = st.columns(4)
+    
+    with col1:
+        st.metric("Total Emails", stats["total_emails"])
+    
+    with col2:
+        st.metric("Open Rate", f"{stats['open_rate']:.1f}%")
+    
+    with col3:
+        st.metric("Click Rate", f"{stats['click_rate']:.1f}%")
+    
+    with col4:
+        st.metric("Bounce Rate", f"{stats['bounce_rate']:.1f}%")
+    
+    # Create charts row
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        st.subheader("Email Status Distribution")
+        
+        # Prepare data for pie chart
+        status_data = stats.get("status_counts", {})
+        if status_data:
+            fig = px.pie(
+                values=list(status_data.values()),
+                names=list(status_data.keys()),
+                color_discrete_sequence=px.colors.qualitative.Plotly,
+                hole=0.4
+            )
+            fig.update_layout(margin=dict(t=0, b=0, l=0, r=0))
+            st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.info("No email status data available yet.")
+    
+    with col2:
+        st.subheader("Email Events")
+        
+        # Prepare data for bar chart
+        event_data = stats.get("event_counts", {})
+        if event_data:
+            event_df = pd.DataFrame({
+                "Event": list(event_data.keys()),
+                "Count": list(event_data.values())
+            })
+            fig = px.bar(
+                event_df, 
+                x="Event", 
+                y="Count",
+                color="Event",
+                color_discrete_sequence=px.colors.qualitative.Plotly
+            )
+            fig.update_layout(margin=dict(t=0, b=0, l=0, r=0))
+            st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.info("No email event data available yet.")
+    
+    # Add engagement over time chart
+    st.subheader("Email Engagement Over Time")
+    
+    # This would normally be populated with real data from the database
+    # For now, we'll use placeholder data
+    try:
+        conn = sqlite3.connect(db.db_path)
+        query = """
+        SELECT 
+            date(occurred_at) as date,
+            event_type,
+            COUNT(*) as count
+        FROM email_events
+        WHERE occurred_at >= date('now', '-30 days')
+        GROUP BY date(occurred_at), event_type
+        ORDER BY date(occurred_at)
+        """
+        engagement_df = pd.read_sql_query(query, conn)
+        conn.close()
+        
+        if not engagement_df.empty:
+            fig = px.line(
+                engagement_df, 
+                x="date", 
+                y="count", 
+                color="event_type",
+                markers=True,
+                color_discrete_sequence=px.colors.qualitative.Plotly
+            )
+            fig.update_layout(
+                xaxis_title="Date",
+                yaxis_title="Number of Events",
+                legend_title="Event Type"
+            )
+            st.plotly_chart(fig, use_container_width=True)
+        else:
+            # Create sample data for demonstration
+            st.info("No historical engagement data available yet. Showing sample data.")
+            
+            # Generate sample data for the last 30 days
+            dates = [(datetime.now() - timedelta(days=i)).strftime("%Y-%m-%d") for i in range(30, 0, -1)]
+            
+            # Sample data for demonstration
+            sample_data = []
+            for date in dates:
+                sample_data.append({"date": date, "event_type": "sent", "count": 10})
+                sample_data.append({"date": date, "event_type": "opened", "count": 7})
+                sample_data.append({"date": date, "event_type": "clicked", "count": 3})
+                
+            sample_df = pd.DataFrame(sample_data)
+            
+            fig = px.line(
+                sample_df, 
+                x="date", 
+                y="count", 
+                color="event_type",
+                markers=True,
+                color_discrete_sequence=px.colors.qualitative.Plotly
+            )
+            fig.update_layout(
+                xaxis_title="Date",
+                yaxis_title="Number of Events",
+                legend_title="Event Type"
+            )
+            st.plotly_chart(fig, use_container_width=True)
+            
+            st.caption("Note: This is sample data for demonstration purposes.")
+    except Exception as e:
+        st.error(f"Error loading engagement data: {str(e)}")
+        st.info("No historical engagement data available yet.")
+
+def display_emails(db):
+    """Display list of emails with their tracking data"""
+    st.header("Email Tracking")
+    
+    # Get recent emails
+    emails = db.get_recent_emails(limit=100)
+    
+    if not emails:
+        st.info("No emails found in the database.")
+        return
+    
+    # Convert to DataFrame for display
+    emails_df = pd.DataFrame(emails)
+    
+    # Format the data for display
+    if not emails_df.empty:
+        # Convert timestamps to datetime
+        if "sent_at" in emails_df.columns:
+            emails_df["sent_at"] = pd.to_datetime(emails_df["sent_at"])
+            emails_df["sent_at"] = emails_df["sent_at"].dt.strftime("%Y-%m-%d %H:%M:%S")
+        
+        if "last_opened" in emails_df.columns:
+            emails_df["last_opened"] = pd.to_datetime(emails_df["last_opened"])
+            emails_df["last_opened"] = emails_df["last_opened"].dt.strftime("%Y-%m-%d %H:%M:%S")
+            
+        if "last_clicked" in emails_df.columns:
+            emails_df["last_clicked"] = pd.to_datetime(emails_df["last_clicked"])
+            emails_df["last_clicked"] = emails_df["last_clicked"].dt.strftime("%Y-%m-%d %H:%M:%S")
+        
+        # Select columns for display
+        display_cols = ["recipient", "subject", "sent_at", "status", "opened", "clicked", "last_opened", "last_clicked"]
+        display_cols = [col for col in display_cols if col in emails_df.columns]
+        
+        # Rename columns for better display
+        rename_map = {
+            "recipient": "Recipient",
+            "subject": "Subject",
+            "sent_at": "Sent At",
+            "status": "Status",
+            "opened": "Opens",
+            "clicked": "Clicks",
+            "last_opened": "Last Opened",
+            "last_clicked": "Last Clicked"
+        }
+        
+        # Apply renaming only for columns that exist
+        rename_map = {k: v for k, v in rename_map.items() if k in display_cols}
+        display_df = emails_df[display_cols].rename(columns=rename_map)
+        
+        # Add styling
+        st.dataframe(
+            display_df,
+            use_container_width=True,
+            hide_index=True
+        )
+        
+        # Add detailed view for selected email
+        st.subheader("Email Details")
+        
+        # Create a selectbox with email subjects
+        selected_email_idx = st.selectbox(
+            "Select an email to view details",
+            options=list(range(len(emails))),
+            format_func=lambda i: f"{emails[i]['subject']} - {emails[i]['recipient']}"
+        )
+        
+        selected_email = emails[selected_email_idx]
+        
+        # Display email details
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            st.markdown(f"**Subject:** {selected_email['subject']}")
+            st.markdown(f"**Recipient:** {selected_email['recipient']}")
+            st.markdown(f"**Sent At:** {selected_email['sent_at']}")
+            st.markdown(f"**Status:** {selected_email['status']}")
+        
+        with col2:
+            st.markdown(f"**Opens:** {selected_email.get('opened', 0)}")
+            st.markdown(f"**Clicks:** {selected_email.get('clicked', 0)}")
+            st.markdown(f"**Last Opened:** {selected_email.get('last_opened', 'N/A')}")
+            st.markdown(f"**Last Clicked:** {selected_email.get('last_clicked', 'N/A')}")
+        
+        # Get events for this email
+        events = db.get_email_events(selected_email["id"])
+        
+        if events:
+            st.subheader("Email Events")
+            
+            # Convert to DataFrame
+            events_df = pd.DataFrame(events)
+            
+            # Format occurred_at
+            events_df["occurred_at"] = pd.to_datetime(events_df["occurred_at"])
+            events_df["occurred_at"] = events_df["occurred_at"].dt.strftime("%Y-%m-%d %H:%M:%S")
+            
+            # Select columns for display
+            display_cols = ["event_type", "occurred_at"]
+            
+            # Rename columns
+            rename_map = {
+                "event_type": "Event Type",
+                "occurred_at": "Occurred At"
+            }
+            
+            display_df = events_df[display_cols].rename(columns=rename_map)
+            
+            st.dataframe(
+                display_df,
+                use_container_width=True,
+                hide_index=True
+            )
+        else:
+            st.info("No events found for this email.")
+    else:
+        st.info("No emails found in the database.")
+
+def display_events(db):
+    """Display email events and analytics"""
+    st.header("Email Events Analytics")
+    
+    # Connect to the database
+    try:
+        conn = sqlite3.connect(db.db_path)
+        
+        # Get all events
+        query = """
+        SELECT 
+            e.event_type,
+            e.occurred_at,
+            em.recipient,
+            em.subject
+        FROM email_events e
+        JOIN emails em ON e.email_id = em.id
+        ORDER BY e.occurred_at DESC
+        LIMIT 100
+        """
+        
+        events_df = pd.read_sql_query(query, conn)
+        conn.close()
+        
+        if not events_df.empty:
+            # Format occurred_at
+            events_df["occurred_at"] = pd.to_datetime(events_df["occurred_at"])
+            events_df["occurred_at"] = events_df["occurred_at"].dt.strftime("%Y-%m-%d %H:%M:%S")
+            
+            # Rename columns
+            events_df = events_df.rename(columns={
+                "event_type": "Event Type",
+                "occurred_at": "Occurred At",
+                "recipient": "Recipient",
+                "subject": "Subject"
+            })
+            
+            st.dataframe(
+                events_df,
+                use_container_width=True,
+                hide_index=True
+            )
+            
+            # Event type distribution
+            st.subheader("Event Type Distribution")
+            
+            event_counts = events_df["Event Type"].value_counts().reset_index()
+            event_counts.columns = ["Event Type", "Count"]
+            
+            fig = px.pie(
+                event_counts,
+                values="Count",
+                names="Event Type",
+                color_discrete_sequence=px.colors.qualitative.Plotly,
+                hole=0.4
+            )
+            
+            st.plotly_chart(fig, use_container_width=True)
+            
+            # Events over time
+            st.subheader("Events Over Time")
+            
+            # Convert back to datetime for grouping
+            events_df["Date"] = pd.to_datetime(events_df["Occurred At"]).dt.date
+            
+            time_events = events_df.groupby(["Date", "Event Type"]).size().reset_index(name="Count")
+            
+            fig = px.line(
+                time_events,
+                x="Date",
+                y="Count",
+                color="Event Type",
+                markers=True
+            )
+            
+            st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.info("No email events found in the database.")
+            
+    except Exception as e:
+        st.error(f"Error loading events data: {str(e)}")
+        st.info("No email events found in the database.")
+
+def webhook_endpoint():
+    """Display webhook endpoint information and testing interface"""
+    st.header("Resend Webhook Integration")
+    
+    # Get the webhook URL and secret from session state or environment
+    webhook_url = st.session_state.get("webhook_url", "https://lead-generation-enricher-agent.streamlit.app/api/resend-hook")
+    webhook_secret = st.secrets.get("RESEND_WEBHOOK_SECRET", "")
+    
+    st.markdown("""
+    ### Webhook Configuration
+    
+    To receive email tracking events from Resend, configure a webhook in your Resend dashboard:
+    
+    1. Go to your [Resend Dashboard](https://resend.com/webhooks)
+    2. Click "Add Endpoint"
+    3. Enter your webhook URL: `https://your-app-url/webhook`
+    4. Select the events you want to receive:
+       - Email events: `email.sent`, `email.delivered`, `email.opened`, `email.clicked`, etc.
+       - Contact events: `contact.created`, `contact.updated`, `contact.deleted`
+       - Domain events: `domain.created`, `domain.updated`, `domain.deleted`
+    5. Save your webhook configuration
+    
+    ### Testing Webhooks
+    
+    You can simulate webhook events using the form below:
+    """)
+    
+    # Display current webhook configuration
+    st.subheader("Current Configuration")
+    st.info(f"Webhook URL: {webhook_url}")
+    if webhook_secret:
+        st.success("✅ Webhook signing secret is configured")
+    else:
+        st.warning("⚠️ Webhook signing secret is not configured")
+    
+    # Add webhook testing interface
+    st.subheader("Test Webhook Events")
+    
+    # Create a form for testing webhooks
+    with st.form("webhook_test_form"):
+        event_type = st.selectbox(
+            "Event Type",
+            options=[
+                "email.sent", "email.delivered", "email.opened", "email.clicked",
+                "email.bounced", "email.complained", "email.failed",
+                "contact.created", "contact.updated", "contact.deleted",
+                "domain.created", "domain.updated", "domain.deleted"
+            ]
+        )
+        
+        # Create a sample payload based on the event type
+        if event_type.startswith("email."):
+            sample_payload = {
+                "type": event_type,
+                "data": {
+                    "email_id": f"email_{int(time.time())}",
+                    "to": "recipient@example.com",
+                    "subject": "Test Email",
+                    "from": "sender@example.com"
+                }
+            }
+        elif event_type.startswith("contact."):
+            sample_payload = {
+                "type": event_type,
+                "data": {
+                    "id": f"contact_{int(time.time())}",
+                    "email": "contact@example.com",
+                    "first_name": "Test",
+                    "last_name": "Contact"
+                }
+            }
+        else:  # domain events
+            sample_payload = {
+                "type": event_type,
+                "data": {
+                    "id": f"domain_{int(time.time())}",
+                    "name": "example.com",
+                    "status": "active"
+                }
+            }
+        
+        # Display and allow editing of the sample payload
+        payload_json = st.text_area(
+            "Webhook Payload",
+            value=json.dumps(sample_payload, indent=2),
+            height=300
+        )
+        
+        submit_button = st.form_submit_button("Send Test Webhook")
+    
+    if submit_button:
+        try:
+            # Parse the payload
+            payload = json.loads(payload_json)
+            
+            # Create webhook handler instance
+            db = EmailTrackingDB()
+            webhook_handler = ResendWebhookHandler(db)
+            
+            # Process the webhook
+            result = webhook_handler.process_webhook(payload)
+            
+            # Display the result
+            st.success("Webhook processed successfully!")
+            st.json(result)
+        except json.JSONDecodeError:
+            st.error("Invalid JSON payload")
+        except Exception as e:
+            st.error(f"Error processing webhook: {str(e)}")
+    
+    # Add webhook event log
+    st.subheader("Recent Webhook Events")
+    
+    try:
+        # Connect to the database
+        conn = sqlite3.connect("email_tracking.db")
+        
+        # Get recent events
+        query = """
+        SELECT 
+            event_type,
+            occurred_at,
+            metadata
+        FROM email_events
+        ORDER BY occurred_at DESC
+        LIMIT 10
+        """
+        
+        events_df = pd.read_sql_query(query, conn)
+        conn.close()
+        
+        if not events_df.empty:
+            # Format occurred_at
+            events_df["occurred_at"] = pd.to_datetime(events_df["occurred_at"])
+            events_df["occurred_at"] = events_df["occurred_at"].dt.strftime("%Y-%m-%d %H:%M:%S")
+            
+            # Format metadata
+            events_df["metadata"] = events_df["metadata"].apply(lambda x: json.loads(x) if x else {})
+            events_df["details"] = events_df["metadata"].apply(lambda x: ", ".join([f"{k}: {v}" for k, v in x.items() if k != "payload"]))
+            
+            # Select columns for display
+            display_df = events_df[["event_type", "occurred_at", "details"]].rename(columns={
+                "event_type": "Event Type",
+                "occurred_at": "Occurred At",
+                "details": "Details"
+            })
+            
+            st.dataframe(
+                display_df,
+                use_container_width=True,
+                hide_index=True
+            )
+        else:
+            st.info("No webhook events found in the database.")
+            
+    except Exception as e:
+        st.error(f"Error loading webhook events: {str(e)}")
+        st.info("No webhook events found in the database.") 
+
+
+import streamlit as st
+import json
+import sqlite3
+import os
+import hashlib
+import pandas as pd
+from datetime import datetime
+from typing import Dict, List, Any, Optional, Union
+import time
+
+# Define the database path
+DB_PATH = "email_tracking.db"
+
+class EmailTrackingDB:
+    """Class to handle email tracking database operations"""
+    
+    def __init__(self, db_path: str = DB_PATH):
+        self.db_path = db_path
+        self.initialize_db()
+    
+    def initialize_db(self):
+        """Initialize the SQLite database with required tables"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        
+        # Create emails table
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS emails (
+            id TEXT PRIMARY KEY,
+            recipient TEXT,
+            subject TEXT,
+            sent_at TEXT,
+            status TEXT,
+            metadata TEXT
+        )
+        """)
+        
+        # Create email_events table
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS email_events (
+            id TEXT PRIMARY KEY,
+            email_id TEXT,
+            event_type TEXT,
+            occurred_at TEXT,
+            metadata TEXT,
+            FOREIGN KEY (email_id) REFERENCES emails (id)
+        )
+        """)
+        
+        conn.commit()
+        conn.close()
+    
+    def record_email(self, email_data: Dict) -> str:
+        """Record a new email in the database"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        
+        cursor.execute("""
+        INSERT INTO emails (id, recipient, subject, sent_at, status, metadata)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """, (
+            email_data["id"],
+            email_data["recipient"],
+            email_data["subject"],
+            email_data["sent_at"],
+            email_data["status"],
+            json.dumps(email_data.get("metadata", {}))
+        ))
+        
+        conn.commit()
+        conn.close()
+        return email_data["id"]
+    
+    def record_event(self, event_data: Dict) -> str:
+        """Record a new email event in the database"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        
+        event_id = hashlib.md5(f"{event_data['email_id']}:{event_data['event_type']}:{datetime.now().timestamp()}".encode()).hexdigest()
+        
+        cursor.execute("""
+        INSERT INTO email_events (id, email_id, event_type, occurred_at, metadata)
+        VALUES (?, ?, ?, ?, ?)
+        """, (
+            event_id,
+            event_data["email_id"],
+            event_data["event_type"],
+            event_data["occurred_at"],
+            json.dumps(event_data.get("metadata", {}))
+        ))
+        
+        conn.commit()
+        conn.close()
+        return event_id
+    
+    def get_email_by_resend_id(self, resend_id: str) -> Optional[Dict]:
+        """Get email details by Resend ID"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        
+        # First try exact match in metadata
+        cursor.execute("""
+        SELECT * FROM emails 
+        WHERE metadata LIKE ?
+        """, (f'%"resend_id": "{resend_id}"%',))
+        
+        row = cursor.fetchone()
+        if row:
+            email_dict = dict(zip(['id', 'recipient', 'subject', 'sent_at', 'status', 'metadata'], row))
+            email_dict["metadata"] = json.loads(email_dict["metadata"]) if email_dict["metadata"] else {}
+            conn.close()
+            return email_dict
+        
+        # If not found, try a broader search in metadata
+        cursor.execute("""
+        SELECT * FROM emails
+        WHERE metadata LIKE ?
+        """, (f'%{resend_id}%',))
+        
+        row = cursor.fetchone()
+        if row:
+            email_dict = dict(zip(['id', 'recipient', 'subject', 'sent_at', 'status', 'metadata'], row))
+            email_dict["metadata"] = json.loads(email_dict["metadata"]) if email_dict["metadata"] else {}
+            conn.close()
+            return email_dict
+        
+        conn.close()
+        return None
+    
+    def get_email_stats(self) -> Dict:
+        """Get email statistics"""
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        
+        # Get total emails
+        cursor.execute("SELECT COUNT(*) as count FROM emails")
+        total_emails = cursor.fetchone()["count"]
+        
+        # Get stats by status
+        cursor.execute("""
+        SELECT status, COUNT(*) as count 
+        FROM emails 
+        GROUP BY status
+        """)
+        status_counts = {row["status"]: row["count"] for row in cursor.fetchall()}
+        
+        # Get event counts
+        cursor.execute("""
+        SELECT event_type, COUNT(*) as count 
+        FROM email_events 
+        GROUP BY event_type
+        """)
+        event_counts = {row["event_type"]: row["count"] for row in cursor.fetchall()}
+        
+        # Get open rate
+        open_rate = 0
+        if total_emails > 0 and "opened" in event_counts:
+            open_rate = (event_counts["opened"] / total_emails) * 100
+            
+        # Get click rate
+        click_rate = 0
+        if total_emails > 0 and "clicked" in event_counts:
+            click_rate = (event_counts["clicked"] / total_emails) * 100
+            
+        # Get bounce rate
+        bounce_rate = 0
+        if total_emails > 0 and "bounced" in event_counts:
+            bounce_rate = (event_counts["bounced"] / total_emails) * 100
+        
+        conn.close()
+        
+        return {
+            "total_emails": total_emails,
+            "status_counts": status_counts,
+            "event_counts": event_counts,
+            "open_rate": open_rate,
+            "click_rate": click_rate,
+            "bounce_rate": bounce_rate
+        }
+    
+    def get_recent_emails(self, limit: int = 50) -> List[Dict]:
+        """Get recent emails with their latest events"""
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        
+        cursor.execute("""
+        SELECT e.*, 
+               (SELECT COUNT(*) FROM email_events WHERE email_id = e.id AND event_type = 'opened') as opened,
+               (SELECT COUNT(*) FROM email_events WHERE email_id = e.id AND event_type = 'clicked') as clicked,
+               (SELECT MAX(occurred_at) FROM email_events WHERE email_id = e.id AND event_type = 'opened') as last_opened,
+               (SELECT MAX(occurred_at) FROM email_events WHERE email_id = e.id AND event_type = 'clicked') as last_clicked
+        FROM emails e
+        ORDER BY e.sent_at DESC
+        LIMIT ?
+        """, (limit,))
+        
+        emails = []
+        for row in cursor.fetchall():
+            email_dict = dict(row)
+            email_dict["metadata"] = json.loads(email_dict["metadata"]) if email_dict["metadata"] else {}
+            emails.append(email_dict)
+        
+        conn.close()
+        
+        return emails
+    
+    def get_email_events(self, email_id: str) -> List[Dict]:
+        """Get all events for a specific email"""
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        
+        cursor.execute("""
+        SELECT * FROM email_events
+        WHERE email_id = ?
+        ORDER BY occurred_at DESC
+        """, (email_id,))
+        
+        events = []
+        for row in cursor.fetchall():
+            event_dict = dict(row)
+            event_dict["metadata"] = json.loads(event_dict["metadata"]) if event_dict["metadata"] else {}
+            events.append(event_dict)
+        
+        conn.close()
+        
+        return events
+
+class ResendWebhookHandler:
+    """Handler for Resend webhook events"""
+    
+    def __init__(self, db: EmailTrackingDB):
+        self.db = db
+    
+    def process_webhook(self, payload: Dict) -> Dict:
+        """Process a webhook payload from Resend"""
+        try:
+            event_type = payload.get("type")
+            
+            if not event_type:
+                return {"status": "error", "message": "Missing event type"}
+            
+            if event_type.startswith("email."):
+                return self._handle_email_event(payload)
+            else:
+                return {"status": "error", "message": f"Unsupported event type: {event_type}"}
+        
+        except Exception as e:
+            return {"status": "error", "message": f"Error processing webhook: {str(e)}"}
+    
+    def _handle_email_event(self, payload: Dict) -> Dict:
+        """Handle email-related events"""
+        event_type = payload.get("type").replace("email.", "")
+        data = payload.get("data", {})
+        email_id = data.get("email_id")
+        
+        if not email_id:
+            return {"status": "error", "message": "Missing email_id in payload"}
+        
+        # Find the email in our database using the Resend ID
+        email = self.db.get_email_by_resend_id(email_id)
+        
+        if not email and event_type == "sent":
+            # If it's a sent event and we don't have the email, record it
+            email_data = {
+                "id": hashlib.md5(f"{email_id}:{datetime.now().timestamp()}".encode()).hexdigest(),
+                "recipient": data.get("to", [None])[0],  # Resend sends 'to' as an array
+                "subject": data.get("subject"),
+                "sent_at": data.get("created_at") or datetime.now().isoformat(),
+                "status": "sent",
+                "metadata": {
+                    "resend_id": email_id,
+                    "from": data.get("from"),
+                    "tags": data.get("tags", [])
+                }
+            }
+            db_email_id = self.db.record_email(email_data)
+        elif email:
+            db_email_id = email["id"]
+        else:
+            return {"status": "error", "message": f"Email not found for ID: {email_id}"}
+        
+        # Record the event with all relevant metadata
+        event_data = {
+            "email_id": db_email_id,
+            "event_type": event_type,
+            "occurred_at": payload.get("created_at") or datetime.now().isoformat(),
+            "metadata": {
+                "created_at": data.get("created_at"),
+                "tags": data.get("tags", [])
+            }
+        }
+        
+        # Add event-specific metadata
+        if event_type == "bounced" and "bounce" in data:
+            event_data["metadata"]["bounce"] = data["bounce"]
+        elif event_type == "clicked" and "click" in data:
+            event_data["metadata"]["click"] = data["click"]
+        
+        self.db.record_event(event_data)
+        
+        return {"status": "success", "message": f"Recorded {event_type} event for email {db_email_id}"}
+
+def verify_signature(payload: bytes, signature: str, secret: str) -> bool:
+    """Verify the webhook signature from Resend"""
+    if not signature or not secret:
+        return False
+    
+    computed_signature = hmac.new(
+        key=secret.encode(),
+        msg=payload,
+        digestmod=hashlib.sha256
+    ).hexdigest()
+    
+    return hmac.compare_digest(computed_signature, signature)
+
+def webhook_endpoint_handler():
+    """Handle incoming webhook requests at /api/resend-hook"""
+    st.title("📨 Webhook Endpoint")
+    
+    # Get the webhook secret from environment
+    webhook_secret = st.secrets.get("RESEND_WEBHOOK_SECRET", "")
+    
+    # Display webhook configuration
+    st.info(f"Webhook URL: https://lead-generation-enricher-agent.streamlit.app/api/resend-hook")
+    if webhook_secret:
+        st.success("✅ Webhook secret is configured")
+    else:
+        st.warning("⚠️ Webhook secret is not configured")
+    
+    # Create tabs for testing and viewing events
+    test_tab, events_tab = st.tabs(["Test Webhook", "Recent Events"])
+    
+    with test_tab:
+        st.subheader("Test Webhook")
+        with st.form("webhook_test"):
+            event_type = st.selectbox(
+                "Event Type",
+                options=[
+                    "email.sent",
+                    "email.delivered",
+                    "email.opened",
+                    "email.clicked",
+                    "email.bounced",
+                    "email.complained",
+                    "email.delivery_delayed",
+                    "email.failed"
+                ]
+            )
+            
+            # Create sample payload matching Resend's format
+            current_time = datetime.now().isoformat()
+            test_payload = {
+                "type": event_type,
+                "created_at": current_time,
+                "data": {
+                    "created_at": current_time,
+                    "email_id": f"msg_{hashlib.md5(str(time.time()).encode()).hexdigest()[:24]}",
+                    "from": "Acme <onboarding@resend.dev>",
+                    "to": ["recipient@example.com"],
+                    "subject": "Test Email",
+                    "tags": [
+                        {
+                            "name": "category",
+                            "value": "test_email"
+                        }
+                    ]
+                }
+            }
+            
+            # Add event-specific data
+            if event_type == "email.bounced":
+                test_payload["data"]["bounce"] = {
+                    "message": "The recipient's email address is on the suppression list.",
+                    "subType": "Suppressed",
+                    "type": "Permanent"
+                }
+            elif event_type == "email.clicked":
+                test_payload["data"]["click"] = {
+                    "ipAddress": "122.115.53.11",
+                    "link": "https://resend.com",
+                    "timestamp": current_time,
+                    "userAgent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15"
+                }
+            
+            payload_json = st.text_area(
+                "Webhook Payload (Resend Format)",
+                value=json.dumps(test_payload, indent=2)
+            )
+            
+            submitted = st.form_submit_button("Send Test Webhook")
+            
+            if submitted:
+                try:
+                    # Parse payload
+                    payload = json.loads(payload_json)
+                    
+                    # Process webhook
+                    db = EmailTrackingDB()
+                    handler = ResendWebhookHandler(db)
+                    result = handler.process_webhook(payload)
+                    
+                    if result["status"] == "success":
+                        st.success(result["message"])
+                    else:
+                        st.error(result["message"])
+                        
+                except Exception as e:
+                    st.error(f"Error processing webhook: {str(e)}")
+    
+    with events_tab:
+        st.subheader("Recent Events")
+        try:
+            # Connect to database
+            conn = sqlite3.connect("email_tracking.db")
+            
+            # Get recent events with email details
+            query = """
+            SELECT 
+                e.event_type,
+                e.occurred_at,
+                em.recipient,
+                em.subject,
+                e.metadata
+            FROM email_events e
+            JOIN emails em ON e.email_id = em.id
+            ORDER BY e.occurred_at DESC
+            LIMIT 50
+            """
+            
+            df = pd.read_sql_query(query, conn)
+            conn.close()
+            
+            if not df.empty:
+                # Format the metadata column to show relevant info
+                df['metadata'] = df['metadata'].apply(lambda x: 
+                    json.dumps({k: v for k, v in json.loads(x).items() 
+                              if k not in ['payload', 'tags']}, indent=2)
+                    if x else "{}")
+                
+                # Display events in a table
+                st.dataframe(
+                    df,
+                    column_config={
+                        "event_type": st.column_config.TextColumn("Event", width="medium"),
+                        "occurred_at": st.column_config.DatetimeColumn("Time", format="D MMM YYYY, HH:mm"),
+                        "recipient": st.column_config.TextColumn("Recipient", width="large"),
+                        "subject": st.column_config.TextColumn("Subject", width="large"),
+                        "metadata": st.column_config.TextColumn("Details", width="large")
+                    },
+                    hide_index=True
+                )
+            else:
+                st.info("No events recorded yet")
+                
+        except Exception as e:
+            st.error(f"Error loading events: {str(e)}")
+
 
 class APIKeyQueue:
     """
@@ -103,52 +1091,77 @@ class AIICPScorer:
         
         self.default_icp_prompt = """You are an ICP (Ideal Customer Profile) evaluator.
 
-Your task is to assess how well this LinkedIn profile matches either of our two ICPs: "operations" or "field_service", using the limited structured fields available.
+Your task is to assess how well this LinkedIn profile matches either of our two ICPs: **"servy"** or **"spectra"**, using only the structured fields below.
 
 Profile Data:
 {profile_json}
 
-ICP Definitions:
+ICP DEFINITIONS
+---------------
 
-1. Operations ICP:
-- Industries: Manufacturing, Industrial Automation, Heavy Equipment, CNC, Robotics, Facility Management, Fleet Ops
-- Roles (from 'jobTitle' or 'headline'): Operations Head, Plant Manager, Maintenance Lead, Production Engineer, Digital Transformation Officer
-- Seniority: Manager level or above
-- Company Maturity Proxy: Company founded before 2020 (≥5 years old)
+1. SERVY ICP
+• Industries (from companyName, companyLinkedIn, or inferred from domain):
+  - Sports facilities (padel, turf, tennis, badminton)
+  - Facility management
+  - Hospitality (hotels, resorts)
+  - Cloud/ghost kitchens
+  - Real estate services (post-handover, property management)
 
-2. Field Service ICP:
-- Industries: Ghost kitchens, cloud kitchens, commercial real estate, managed appliances, kitchen automation, hotels
-- Roles: Facility Manager, Maintenance Coordinator, Service Head, Asset Manager
-- Seniority: Manager level or above
-- Company Maturity Proxy: Founded before 2021 (≥3 years old)
+• Roles:
+  - Owner, General Manager, COO, Operations Head, Facility Manager, Maintenance Manager, Service Manager
 
-Scoring Criteria (each 0–10):
-- industry_fit: Match between 'companyIndustry' and ICP industries
-- role_fit: Match between 'jobTitle' or 'headline' and ICP roles
-- company_maturity_fit: Based on 'companyFoundedYear' (older = higher score)
-- decision_maker: Based on 'seniority', 'functions', or leadership keywords
+• Maturity signal:
+  - Founded before 2021 (≥3 years old)
+  - companyGrowth6Month or companyGrowth12Month positive (nice-to-have)
 
-Scoring Weights:
+2. SPECTRA ICP
+• Industries:
+  - OEMs, equipment manufacturing, machinery, robotics, CNC
+  - Logistics, warehousing, fleet ops, industrial plants
+  - After-sales service networks, equipment rental
+  - Compliance-critical (pharma, food, energy/utilities)
+  - ERP consultants, system integrators
+
+• Roles:
+  - VP Ops, CTO, Product Head, Service Director, Maintenance Head, Technical Director, ERP Consultant, Plant Manager
+
+• Maturity:
+  - Founded before 2020 (≥5 years old)
+  - Growth signals in companyGrowth6Month or 12Month
+
+SCORING CRITERIA (0–10)
+-----------------------
+• industry_fit: Match company domain or name to ICP segments
+• role_fit: Match jobTitle or headline to ICP-aligned roles
+• company_maturity_fit: Score higher for older, established companies
+• decision_maker: Based on 'seniority', 'jobTitle', and 'functions'
+
+SCORING WEIGHTS
+---------------
 - industry_fit: 30%
 - role_fit: 30%
 - company_maturity_fit: 20%
 - decision_maker: 20%
 
-Instructions:
-- Return best-fit ICP: "operations", "field_service", or "none"
-- Use strict logic; if match is weak or unclear, return "none"
-- Output ONLY valid JSON (no extra explanation, markdown, or text)
+OUTPUT FORMAT
+-------------
+Return exactly this JSON structure:
 
-Output Format:
 {{
-    "industry_fit": <0-10>,
-    "role_fit": <0-10>,
-    "company_size_fit": <0-10>,
-    "decision_maker": <0-10>,
-    "total_score": <weighted avg score>,
-    "icp_category": "operations" | "field_service" | "none",
-    "reasoning": "Brief reasoning based on the fields provided"
+  "industry_fit": <0–10>,
+  "role_fit": <0–10>,
+  "company_maturity_fit": <0–10>,
+  "decision_maker": <0–10>,
+  "total_score": <weighted average>,
+  "icp_category": "servy" | "spectra" | "none",
+  "reasoning": "Brief reasoning based on available fields"
 }}
+
+RULES
+-----
+- Use strict logic; if matching evidence is weak or absent, assign low scores and return "none"
+- Do not output anything besides the JSON object
+
 """
 
 
@@ -332,7 +1345,18 @@ LinkedIn: {lead_data.get('linkedin_url', '')}
             ]
             
             response = self.llm.invoke(messages)
-            return response.content.strip()
+            email_content = response.content.strip()
+            
+            # Ensure the content is wrapped in a div with some basic styling
+            if not email_content.startswith('<div'):
+                email_content = f"""<div style="font-family: Arial, sans-serif; line-height: 1.6; color: #333333;">
+{email_content}
+</div>"""
+                
+            # Ensure paragraphs have proper styling
+            email_content = email_content.replace('<p>', '<p style="margin-bottom: 16px;">')
+            
+            return email_content
             
         except Exception as e:
             st.error(f"Error generating email: {str(e)}")
@@ -349,6 +1373,12 @@ class EmailManager:
     def send_email(self, to_email: str, subject: str, body: str) -> Dict:
         """Send email using Resend API"""
         try:
+            # Get the base URL for webhooks
+            webhook_url = st.session_state.get("webhook_url", "https://lead-generation-enricher-agent.streamlit.app/api/resend-hook")
+            
+            # Print webhook URL for debugging
+            print(f"Using webhook URL: {webhook_url}")
+            
             response = requests.post(
                 "https://api.resend.com/emails",
                 headers={
@@ -357,13 +1387,47 @@ class EmailManager:
                 },
                 json={
                     "from": self.sender_email,
-                    "to": "sujay0620@gmail.com",
+                    "to": "sujay0620@gmail.com",  # Use the actual recipient email in production
                     "subject": subject,
-                    "html": body  # Resend uses html parameter instead of text
+                    "html": body,  # Resend uses html parameter instead of text
+                    "tags": [
+                        {"name": "lead_source", "value": "apollo_io"}
+                    ],
+                    "webhook_url": webhook_url
                 }
             )
             
             if response.status_code in [200, 201]:
+                # Store email in tracking database if available
+                try:
+                    # EmailTrackingDB is defined within this file
+                    # No need to import it
+                    db = EmailTrackingDB()
+                    
+                    # Get the Resend email ID from the response
+                    response_data = response.json()
+                    resend_id = response_data.get("id", "")
+                    
+                    # Record the email in the tracking database
+                    email_data = {
+                        "recipient": to_email,
+                        "subject": subject,
+                        "sent_at": datetime.now().isoformat(),
+                        "status": "sent",
+                        "metadata": {
+                            "resend_id": resend_id,
+                            "response": response_data
+                        }
+                    }
+                    
+                    db.record_email(email_data)
+                except ImportError:
+                    # Email tracking module not available
+                    pass
+                except Exception as tracking_error:
+                    # Log the error but don't fail the email send operation
+                    print(f"Error recording email in tracking database: {str(tracking_error)}")
+                
                 return {"status": "success", "message": "Email sent successfully"}
             else:
                 return {"status": "error", "message": f"Resend API returned {response.status_code}: {response.text}"}
@@ -1135,6 +2199,9 @@ def email_management_page():
     st.header("📧 Email Management")
     st.markdown("Review your leads and send personalized cold emails")
     
+    # Initialize email manager
+    email_manager = EmailManager(RESEND_API_KEY, "resend.dev", SENDER_EMAIL)
+    
     # Get leads from sheets
     sheets_service = setup_google_sheets()
     if not sheets_service:
@@ -1168,122 +2235,122 @@ def email_management_page():
         index=0
     )
 
-    # Bulk email section
-    st.markdown("---")
-    st.subheader("📨 Bulk Email Options")
+    # # Bulk email section
+    # st.markdown("---")
+    # st.subheader("📨 Bulk Email Options")
     
-    # Initialize email manager
-    email_manager = EmailManager(RESEND_API_KEY, "resend.dev", SENDER_EMAIL)
+    # # Initialize email manager
+    # email_manager = EmailManager(RESEND_API_KEY, "resend.dev", SENDER_EMAIL)
     
-    # Calculate stats for unsent emails
-    unsent_leads = []
-    for idx, lead in leads_df.iterrows():
-        email_key = f"email_sent_{hashlib.md5(lead.get('linkedin_url', '').encode()).hexdigest()}"
-        if not st.session_state.get(email_key, False):
-            unsent_leads.append(lead)
+    # # Calculate stats for unsent emails
+    # unsent_leads = []
+    # for idx, lead in leads_df.iterrows():
+    #     email_key = f"email_sent_{hashlib.md5(lead.get('linkedin_url', '').encode()).hexdigest()}"
+    #     if not st.session_state.get(email_key, False):
+    #         unsent_leads.append(lead)
     
-    col1, col2 = st.columns([3, 1])
-    with col1:
-        st.info(f"📊 {len(unsent_leads)} leads haven't been emailed yet")
+    # col1, col2 = st.columns([3, 1])
+    # with col1:
+    #     st.info(f"📊 {len(unsent_leads)} leads haven't been emailed yet")
         
-    with col2:
-        if len(unsent_leads) > 0:
-            if st.button("🚀 Generate & Send All", help="Generate and send emails to all leads that haven't been contacted"):
-                bulk_progress = st.progress(0)
-                status_text = st.empty()
+    # with col2:
+    #     if len(unsent_leads) > 0:
+    #         if st.button("🚀 Generate & Send All", help="Generate and send emails to all leads that haven't been contacted"):
+    #             bulk_progress = st.progress(0)
+    #             status_text = st.empty()
                 
-                successful_sends = 0
-                failed_sends = 0
+    #             successful_sends = 0
+    #             failed_sends = 0
                 
-                for idx, lead in enumerate(unsent_leads):
-                    try:
-                        status_text.text(f"Processing {idx + 1}/{len(unsent_leads)}: {lead.get('fullName', 'Unknown')}")
+    #             for idx, lead in enumerate(unsent_leads):
+    #                 try:
+    #                     status_text.text(f"Processing {idx + 1}/{len(unsent_leads)}: {lead.get('fullName', 'Unknown')}")
                         
-                        # Prepare lead data
-                        lead_data = {
-                            "fullName": lead.get('fullName', ''),
-                            "firstName": lead.get('firstName', ''),
-                            "lastName": lead.get('lastName', ''),
-                            "email": lead.get('email', ''),
-                            "jobTitle": lead.get('jobTitle', ''),
-                            "companyName": lead.get('companyName', ''),
-                            "companyIndustry": lead.get('companyIndustry', ''),
-                            "companyWebsite": lead.get('companyWebsite', ''),
-                            "companyLinkedin": lead.get('companyLinkedin', ''),
-                            "linkedin_url": lead.get('linkedin_url', ''),
-                            "location": lead.get('location', ''),
-                            "headline": lead.get('headline', ''),
-                            "about": lead.get('about', ''),
-                            "icp_score": lead.get('icp_percentage', 0),
-                            "icp_grade": lead.get('icp_grade', 'N/A')
-                        }
+    #                     # Prepare lead data
+    #                     lead_data = {
+    #                         "fullName": lead.get('fullName', ''),
+    #                         "firstName": lead.get('firstName', ''),
+    #                         "lastName": lead.get('lastName', ''),
+    #                         "email": lead.get('email', ''),
+    #                         "jobTitle": lead.get('jobTitle', ''),
+    #                         "companyName": lead.get('companyName', ''),
+    #                         "companyIndustry": lead.get('companyIndustry', ''),
+    #                         "companyWebsite": lead.get('companyWebsite', ''),
+    #                         "companyLinkedin": lead.get('companyLinkedin', ''),
+    #                         "linkedin_url": lead.get('linkedin_url', ''),
+    #                         "location": lead.get('location', ''),
+    #                         "headline": lead.get('headline', ''),
+    #                         "about": lead.get('about', ''),
+    #                         "icp_score": lead.get('icp_percentage', 0),
+    #                         "icp_grade": lead.get('icp_grade', 'N/A')
+    #                     }
                         
-                        # Generate email
-                        result = email_manager.generate_and_preview_email(lead_data)
+    #                     # Generate email
+    #                     result = email_manager.generate_and_preview_email(lead_data)
                         
-                        if result["status"] == "success":
-                            # Send email
-                            send_result = email_manager.send_email(
-                                result["to_email"],
-                                result["subject"],
-                                result["body"]
-                            )
+    #                     if result["status"] == "success":
+    #                         # Send email
+    #                         send_result = email_manager.send_email(
+    #                             result["to_email"],
+    #                             result["subject"],
+    #                             result["body"]
+    #                         )
                             
-                            if send_result["status"] == "success":
-                                # Mark as sent in session state
-                                email_key = f"email_sent_{hashlib.md5(lead.get('linkedin_url', '').encode()).hexdigest()}"
-                                st.session_state[email_key] = True
+    #                         if send_result["status"] == "success":
+    #                             # Mark as sent in session state
+    #                             email_key = f"email_sent_{hashlib.md5(lead.get('linkedin_url', '').encode()).hexdigest()}"
+    #                             st.session_state[email_key] = True
                                 
-                                # Update the email_status in Google Sheets
-                                try:
-                                    # Get the sheet
-                                    ss = sheets_service.open("Leadgen")
-                                    sheet = ss.worksheet("Sheet1")
+    #                             # Update the email_status in Google Sheets
+    #                             try:
+    #                                 # Get the sheet
+    #                                 ss = sheets_service.open("Leadgen")
+    #                                 sheet = ss.worksheet("Sheet1")
                                     
-                                    # Find the row with this LinkedIn URL
-                                    linkedin_url = lead.get('linkedin_url', '')
-                                    if linkedin_url:
-                                        # Get all LinkedIn URLs
-                                        linkedin_urls = sheet.col_values(1)  # Assuming LinkedIn URL is in column A
-                                        if linkedin_url in linkedin_urls:
-                                            row_idx = linkedin_urls.index(linkedin_url) + 1  # +1 because sheets are 1-indexed
-                                            # Find the email_status column
-                                            headers = sheet.row_values(1)
-                                            if 'email_status' in headers:
-                                                col_idx = headers.index('email_status') + 1  # +1 because sheets are 1-indexed
-                                                # Update the cell
-                                                sheet.update_cell(row_idx, col_idx, "Sent")
-                                except Exception as sheet_e:
-                                    st.warning(f"Could not update email status in sheet: {str(sheet_e)}")
+    #                                 # Find the row with this LinkedIn URL
+    #                                 linkedin_url = lead.get('linkedin_url', '')
+    #                                 if linkedin_url:
+    #                                     # Get all LinkedIn URLs
+    #                                     linkedin_urls = sheet.col_values(1)  # Assuming LinkedIn URL is in column A
+    #                                     if linkedin_url in linkedin_urls:
+    #                                         row_idx = linkedin_urls.index(linkedin_url) + 1  # +1 because sheets are 1-indexed
+    #                                         # Find the email_status column
+    #                                         headers = sheet.row_values(1)
+    #                                         if 'send_email_status' in headers:
+    #                                             col_idx = headers.index('send_email_status') + 1  # +1 because sheets are 1-indexed
+    #                                             # Update the cell
+    #                                             sheet.update_cell(row_idx, col_idx, "Sent")
+    #                             except Exception as sheet_e:
+    #                                 st.warning(f"Could not update email status in sheet: {str(sheet_e)}")
                                 
-                                successful_sends += 1
-                            else:
-                                failed_sends += 1
-                        else:
-                            failed_sends += 1
+    #                             successful_sends += 1
+    #                         else:
+    #                             failed_sends += 1
+    #                     else:
+    #                         failed_sends += 1
                         
-                        # Update progress
-                        bulk_progress.progress((idx + 1) / len(unsent_leads))
+    #                     # Update progress
+    #                     bulk_progress.progress((idx + 1) / len(unsent_leads))
                         
-                    except Exception as e:
-                        st.error(f"Error processing {lead.get('fullName', 'Unknown')}: {str(e)}")
-                        failed_sends += 1
+    #                 except Exception as e:
+    #                     st.error(f"Error processing {lead.get('fullName', 'Unknown')}: {str(e)}")
+    #                     failed_sends += 1
                     
-                    # Small delay to avoid rate limits
-                    time.sleep(1)
+    #                 # Small delay to avoid rate limits
+    #                 time.sleep(1)
                 
-                # Show final results
-                if successful_sends > 0:
-                    st.success(f"✅ Successfully sent {successful_sends} emails!")
-                if failed_sends > 0:
-                    st.error(f"❌ Failed to send {failed_sends} emails")
+    #             # Show final results
+    #             if successful_sends > 0:
+    #                 st.success(f"✅ Successfully sent {successful_sends} emails!")
+    #             if failed_sends > 0:
+    #                 st.error(f"❌ Failed to send {failed_sends} emails")
                     
-                # Clear progress
-                bulk_progress.empty()
-                status_text.empty()
+    #             # Clear progress
+    #             bulk_progress.empty()
+    #             status_text.empty()
                 
-                # Refresh the page to update UI
-                st.rerun()
+    #             # Refresh the page to update UI
+    #             st.rerun()
     
     # Display leads in a compact format
     st.markdown("---")
@@ -1426,7 +2493,15 @@ def email_management_page():
                         
                         with email_col1:
                             st.text_input("Subject", value=preview["subject"], key=f"subject_{idx}")
-                            email_body = st.text_area("Body", value=preview["body"], height=300, key=f"body_{idx}")
+                            
+                            # HTML preview section
+                            st.markdown("**Email Body Preview:**")
+                            st.markdown(preview["body"], unsafe_allow_html=True)
+                            
+                            # Keep the editable text area but make it less prominent
+                            st.markdown("<details><summary>Edit HTML</summary>", unsafe_allow_html=True)
+                            email_body = st.text_area("Edit HTML directly", value=preview["body"], height=200, key=f"body_{idx}")
+                            st.markdown("</details>", unsafe_allow_html=True)
                         
                         with email_col2:
                             st.markdown("<br><br>", unsafe_allow_html=True)  # Add some spacing
@@ -1437,6 +2512,8 @@ def email_management_page():
                             st.markdown("<br>", unsafe_allow_html=True)  # Add spacing between buttons
                             if st.button("✉️ Send", key=f"send_{idx}"):
                                 with st.spinner("Sending..."):
+                                    # Initialize email manager
+                                    email_manager = EmailManager(RESEND_API_KEY, "resend.dev", SENDER_EMAIL)
                                     result = email_manager.send_email(
                                         preview["to_email"],
                                         st.session_state[f"subject_{idx}"],
@@ -1463,7 +2540,7 @@ def email_management_page():
                                                     row_idx = linkedin_urls.index(linkedin_url) + 1  # +1 because sheets are 1-indexed
                                                     # Find the email_status column
                                                     headers = sheet.row_values(1)
-                                                    if 'email_status' in headers:
+                                                    if 'send_email_status' in headers:
                                                         col_idx = headers.index('send_email_status') + 1  # +1 because sheets are 1-indexed
                                                         # Update the cell
                                                         sheet.update_cell(row_idx, col_idx, "Sent")
@@ -1479,7 +2556,7 @@ def icp_configuration_page():
     st.header("⚙️ ICP Configuration")
     
     # Create tabs for different configurations
-    icp_tab, email_tab = st.tabs(["🎯 ICP Scoring Prompt", "📧 Email Prompt"])
+    icp_tab, email_tab, webhook_tab = st.tabs(["🎯 ICP Scoring Prompt", "📧 Email Prompt", "🔌 Webhook Settings"])
     
     with icp_tab:
         st.markdown("### ICP Scoring Prompt Configuration")
@@ -1548,6 +2625,34 @@ def icp_configuration_page():
             5. List any phrases or approaches to avoid
             """)
     
+    with webhook_tab:
+        st.markdown("### Webhook Configuration")
+        st.markdown("Configure webhook settings for email tracking with Resend")
+        
+        # Webhook URL configuration
+        webhook_url = st.text_input(
+            "Webhook URL",
+            value=st.session_state.get("webhook_url", "https://your-app-url/webhook"),
+            help="The URL that Resend will send webhook events to. This should be a publicly accessible URL."
+        )
+        
+        # Show webhook configuration instructions
+        with st.expander("📝 Webhook Configuration Guide"):
+            st.markdown("""
+            ### Webhook Setup Instructions:
+            
+            1. **Set your webhook URL** - This should be a publicly accessible URL that can receive POST requests
+            2. **Configure in Resend** - Add this URL in your [Resend Dashboard](https://resend.com/webhooks)
+            3. **Select Events** - Choose which events to receive:
+               - Email events: `email.sent`, `email.delivered`, `email.opened`, `email.clicked`, etc.
+               - Contact events: `contact.created`, `contact.updated`, `contact.deleted`
+               - Domain events: `domain.created`, `domain.updated`, `domain.deleted`
+            
+            ### Testing Your Webhook:
+            
+            Use the Email Dashboard's webhook testing tool to simulate events and verify your webhook is working correctly.
+            """)
+    
     if st.button("💾 Save Configuration"):
         try:
             # Validate that the prompts contain their required placeholders
@@ -1562,6 +2667,7 @@ def icp_configuration_page():
             # Save prompts to session state
             st.session_state["icp_prompt"] = icp_prompt
             st.session_state["email_prompt"] = email_prompt
+            st.session_state["webhook_url"] = webhook_url
             
             st.success("✅ Configuration saved successfully!")
             st.info("Note: In a production environment, this would be saved to a persistent storage.")
@@ -1638,6 +2744,41 @@ Thought: {agent_scratchpad}""")
     
     return agent_executor
 
+def webhook_page():
+    """Webhook endpoint page for handling Resend webhook events"""
+    # Initialize email manager for the webhook handler to use
+    email_manager = EmailManager(RESEND_API_KEY, "resend.dev", SENDER_EMAIL)
+    st.session_state["email_manager"] = email_manager
+    
+    st.title("🔌 Resend Webhook Endpoint")
+    
+    # Display webhook configuration instructions
+    st.markdown("""
+    ### How Resend Webhooks Work
+    
+    1. **Resend tracks email events** (opens, clicks, deliveries, etc.)
+    2. **Resend sends these events to your webhook URL** when they occur
+    3. **Your webhook processes these events** and updates the email tracking database
+    4. **The dashboard displays the updated data** from the tracking database
+    
+    ### Webhook Configuration in Resend
+    
+    To receive email tracking events:
+    
+    1. Go to your [Resend Dashboard](https://resend.com/webhooks)
+    2. Click "Add Endpoint"
+    3. Enter your webhook URL: `{webhook_url}`
+    4. Add your signing secret (already configured in this app)
+    5. Select the events to receive:
+       - Email events: `email.sent`, `email.delivered`, `email.opened`, `email.clicked`, etc.
+    
+    ### Testing Your Webhook
+    
+    Use the form below to simulate webhook events for testing:
+    """.format(webhook_url=st.session_state.get("webhook_url", "https://your-app-url/webhook")))
+    
+    webhook_endpoint_handler()
+
 def main():
     st.set_page_config(
         page_title="Lead Generation System",
@@ -1645,19 +2786,60 @@ def main():
         layout="wide"
     )
     
-    # Navigation
-    st.sidebar.title("Navigation")
+    # Check for webhook path
+    query_params = st.experimental_get_query_params()
+    if "webhook" in query_params:
+        webhook_page()
+        return
+    
+    # # Authentication check
+    # if not st.user.is_logged_in:
+    #     st.title("Lead Generation System")
+    #     st.markdown("Please log in to access the application.")
+        
+    #     col1, col2 = st.columns([2, 1])
+    #     with col1:
+    #         st.info("This application requires authentication to access lead generation features.")
+    #     with col2:
+    #         st.button("Log in", on_click=st.login)
+        
+    #     # Show demo information
+    #     st.markdown("---")
+    #     st.subheader("About Lead Generation System")
+    #     st.markdown("""
+    #     This application provides powerful lead generation capabilities:
+    #     - 🤖 AI-powered lead generation agent
+    #     - 🔍 LinkedIn profile search and enrichment
+    #     - 🎯 Automatic ICP scoring
+    #     - 📧 Email campaign management
+    #     """)
+        
+    #     st.stop()
+    
+    # # User is authenticated, show navigation and content
+    # st.sidebar.title("Navigation")
+    
+    # # Show user info and logout button
+    # with st.sidebar:
+    #     st.write(f"Welcome, **{st.user.name}**")
+    #     st.button("Logout", on_click=st.logout)
+    
+    # Page navigation
     page = st.sidebar.selectbox(
         "Choose a page",
-        ["🎯 Lead Generation", "📧 Email Management", "⚙️ ICP Configuration"]
+        ["🎯 Lead Generation", "📧 Email Management", "📊 Email Dashboard", "⚙️ ICP Configuration", "🔌 Webhook"]
     )
     
     if page == "🎯 Lead Generation":
         lead_generation_page()
     elif page == "📧 Email Management":
         email_management_page()
+    elif page == "📊 Email Dashboard":
+        email_dashboard_page()
     elif page == "⚙️ ICP Configuration":
         icp_configuration_page()
+    elif page == "🔌 Webhook":
+        webhook_page()
 
 def lead_generation_page():
     """Lead generation page with chat interface and direct query option"""
@@ -1901,6 +3083,10 @@ def lead_generation_page():
                     st.markdown(result)
                 except Exception as e:
                     st.error(f"❌ Error generating leads: {str(e)}")
+
+
+
+
 
 if __name__ == "__main__":
     main()
