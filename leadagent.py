@@ -698,7 +698,7 @@ class LeadScrapingTool:
                         "companyGrowth6Month": organization.get("organization_headcount_six_month_growth"),
                         "companyGrowth12Month": organization.get("organization_headcount_twelve_month_growth"),
                         "companyGrowth24Month": organization.get("organization_headcount_twenty_four_month_growth"),
-                        "email_status": "Not Sent",
+                        "send_email_status": "Not Sent",
 
                     }
                     
@@ -721,7 +721,8 @@ class LeadScrapingTool:
             else:
                 st.warning("No profiles could be processed. Please check your search criteria.")
                 
-            return profiles[:num_results]
+            # Return all profiles without limiting to num_results
+            return profiles
 
         except Exception as e:
             st.error(f"Error in Apollo.io scraping: {str(e)}")
@@ -868,7 +869,7 @@ class LeadScrapingTool:
                 "email_domain_catchall", "revealed_for_current_team", "photo_url",
                  "icp_score", "icp_percentage",
                 "icp_grade", "icp_breakdown",
-                "email_status"
+                "send_email_status"
             ]
 
             # Convert enriched data to DataFrame
@@ -1106,7 +1107,7 @@ def get_leads_from_sheets(sheets_service) -> pd.DataFrame:
                 'icp_percentage': 'icp_percentage',
                 'icp_grade': 'icp_grade',
                 'icp_breakdown': 'icp_breakdown',
-                'email_status': 'email_status'
+                'send_email_status': 'send_email_status'
             }
             
             # Only rename columns that exist
@@ -1305,18 +1306,18 @@ def email_management_page():
             st.warning(f"Error filtering by ICP score: {str(e)}")
     
     # Filter by email status
-    if email_status_filter != "All" and 'email_status' in filtered_df.columns:
+    if email_status_filter != "All" and 'send_email_status' in filtered_df.columns:
         try:
             # Convert to string first to handle non-string values
-            filtered_df['email_status'] = filtered_df['email_status'].astype(str)
+            filtered_df['send_email_status'] = filtered_df['send_email_status'].astype(str)
             
             if email_status_filter == "Sent":
-                filtered_df = filtered_df[filtered_df['email_status'].str.lower() == 'sent']
+                filtered_df = filtered_df[filtered_df['send_email_status'].str.lower() == 'sent']
             elif email_status_filter == "Not Sent":
                 # Include both "Not Sent" and empty values
                 filtered_df = filtered_df[
-                    (filtered_df['email_status'].str.lower() == 'not sent') | 
-                    (filtered_df['email_status'].str.strip() == '')
+                    (filtered_df['send_email_status'].str.lower() == 'not sent') | 
+                    (filtered_df['send_email_status'].str.strip() == '')
                 ]
         except Exception as e:
             st.warning(f"Error filtering by email status: {str(e)}")
@@ -1463,7 +1464,7 @@ def email_management_page():
                                                     # Find the email_status column
                                                     headers = sheet.row_values(1)
                                                     if 'email_status' in headers:
-                                                        col_idx = headers.index('email_status') + 1  # +1 because sheets are 1-indexed
+                                                        col_idx = headers.index('send_email_status') + 1  # +1 because sheets are 1-indexed
                                                         # Update the cell
                                                         sheet.update_cell(row_idx, col_idx, "Sent")
                                         except Exception as sheet_e:
@@ -1794,14 +1795,13 @@ def lead_generation_page():
         
         st.subheader("🔍 Direct Lead Search")
         st.markdown("""
-        Specify your search criteria to generate leads:
+        Specify your search criteria to generate leads directly from Apollo.io:
         
         1. Select job titles, locations, and industries from the dropdown menus
         2. Add custom values if needed
         3. Choose company size ranges
         4. Click 'Generate Leads' to start the search
         
-        Each search will retrieve up to 100 leads as set on the sidebar. For best results, use specific locations and job titles.
         """)
         
         with st.form("direct_lead_search_form"):
