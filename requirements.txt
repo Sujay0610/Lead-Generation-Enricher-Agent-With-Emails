@@ -2,6 +2,7 @@ streamlit
 langchain
 langchain-openai
 langchain-community
+langchain-core
 langgraph
 pandas
 requests
@@ -11,3 +12,6 @@ google-auth-oauthlib
 google-auth-httplib2
 openai
 python-dotenv
+Authlib
+streamlit-authenticator
+plotly
