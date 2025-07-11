@@ -22,6 +22,49 @@ import hashlib
 from supabase import create_client
 import asyncio
 from email_template_manager import EmailTemplateManager
+from collections import deque
+
+class APIKeyQueue:
+    """
+    A simple class to manage a rotating queue of API keys.
+    It uses collections.deque to rotate keys in a round-robin fashion.
+    """
+    def __init__(self, keys):
+        if not keys:
+            raise ValueError("At least one API key must be provided.")
+        self.keys = deque(keys)
+        self.total_count = len(keys)
+
+    def get_next_key(self):
+        """
+        Returns the next API key in a round-robin fashion and rotates the queue.
+        """
+        key = self.keys[0]
+        self.keys.rotate(-1)
+        return key
+        
+    def get_all_keys(self):
+        """
+        Returns a list of all API keys in the queue.
+        """
+        return list(self.keys)
+
+    def add_key(self, key):
+        """
+        Adds a new API key to the queue.
+        """
+        self.keys.append(key)
+        self.total_count += 1
+
+    def remove_key(self, key):
+        """
+        Removes an API key from the queue. Raises ValueError if key is not found.
+        """
+        try:
+            self.keys.remove(key)
+            self.total_count -= 1
+        except ValueError:
+            raise ValueError("API key not found in the queue.")
 
 def try_eval(x):
     """Safely evaluate a string representation of a Python object"""
@@ -33,7 +76,11 @@ def try_eval(x):
 
 # Configuration
 OPENAI_API_KEY = st.secrets.get("OPENAI_API_KEY", "")
-APIFY_API_TOKEN = st.secrets.get("APIFY_API_TOKEN", "")
+APIFY_API_TOKENS = st.secrets.get("APIFY_API_TOKEN", [])
+# Make sure APIFY_API_TOKENS is a list
+if isinstance(APIFY_API_TOKENS, str):
+    APIFY_API_TOKENS = [APIFY_API_TOKENS]
+
 GOOGLE_SHEETS_CREDENTIALS = st.secrets.get("GOOGLE_SHEETS_CREDENTIALS", {})
 RESEND_API_KEY = st.secrets.get("RESEND_API_KEY", "")
 SENDER_EMAIL = st.secrets.get("SENDER_EMAIL", "onboarding@resend.dev")  # Default Resend sender
@@ -232,7 +279,7 @@ class EmailGenerator:
     
     def __init__(self, openai_api_key: str):
         self.llm = ChatOpenAI(
-            model="openai/gpt-4.1-nano-2025-04-14",
+            model="openai/gpt-4.1-mini",
             temperature=0.7,  # Slightly higher temperature for more creative emails
             openai_api_key=openai_api_key,
             base_url="https://openrouter.ai/api/v1/",
@@ -349,10 +396,64 @@ class EmailManager:
 class LeadScrapingTool:
     """Enhanced tool for scraping leads with ICP scoring using Apollo.io"""
 
-    def __init__(self, apify_token: str, sheets_service):
-        self.apify_token = apify_token
+    def __init__(self, apify_token_or_tokens, sheets_service):
         self.sheets_service = sheets_service
+        if isinstance(apify_token_or_tokens, list):
+            self.token_queue = APIKeyQueue(apify_token_or_tokens)
+        else:
+            self.token_queue = APIKeyQueue([apify_token_or_tokens])
         self.ai_icp_scorer = AIICPScorer(OPENAI_API_KEY)
+        
+        # Initialize or load used keys from session state
+        if "used_apify_keys" not in st.session_state:
+            st.session_state.used_apify_keys = set()
+        self.used_keys = st.session_state.used_apify_keys
+        
+        # Track total available keys
+        self.total_keys = self.token_queue.total_count
+        
+        # Log current key usage
+        if self.used_keys:
+            st.sidebar.info(f"🔑 API Key Usage: {len(self.used_keys)}/{self.total_keys} keys used today")
+            
+        # Initialize or load exhausted keys from session state
+        if "exhausted_apify_keys" not in st.session_state:
+            st.session_state.exhausted_apify_keys = set()
+        self.exhausted_keys = st.session_state.exhausted_apify_keys
+
+    def get_next_unused_key(self):
+        """Get the next unused API key. If all keys have been used, reset and start over."""
+        # If all keys have been used, reset the used keys tracking
+        if len(self.used_keys) >= self.total_keys:
+            st.warning("⚠️ All API keys have been used today. Resetting usage tracking.")
+            self.used_keys = set()
+            st.session_state.used_apify_keys = self.used_keys
+        
+        # Try to find an unused key that is not exhausted
+        for _ in range(self.total_keys):
+            key = self.token_queue.get_next_key()
+            if key not in self.used_keys and key not in self.exhausted_keys:
+                self.used_keys.add(key)
+                # Update session state
+                st.session_state.used_apify_keys = self.used_keys
+                return key
+                
+        # If all keys are exhausted or used, try to find any key that's not exhausted
+        if len(self.exhausted_keys) < self.total_keys:
+            for _ in range(self.total_keys):
+                key = self.token_queue.get_next_key()
+                if key not in self.exhausted_keys:
+                    return key
+        
+        # If we somehow get here, just return the next key
+        return self.token_queue.get_next_key()
+        
+    def mark_key_exhausted(self, key):
+        """Mark a key as exhausted for the day"""
+        if key not in self.exhausted_keys:
+            self.exhausted_keys.add(key)
+            st.session_state.exhausted_apify_keys = self.exhausted_keys
+            st.warning(f"API key {key[:10]}... marked as exhausted for today ({len(self.exhausted_keys)}/{self.total_keys} keys exhausted)")
 
     def generate_apollo_url(self, query_data: dict) -> str:
         """Generate Apollo.io search URL from query parameters"""
@@ -414,67 +515,114 @@ class LeadScrapingTool:
         return final_url
 
     def search_apollo_profiles(self, query: str, num_results: int = 50) -> List[Dict]:
-        """Search for profiles using Apify Apollo scraper"""
-        try:
-            st.info(f"🔍 Starting Apollo.io scraping with query: {query}")
-            progress_bar = st.progress(0)
-            status_text = st.empty()
-            
-            status_text.text("⏳ Waiting for Apollo.io scraper to initialize (this may take a few minutes)...")
-
-            # Call Apify Apollo scraper
-            url = "https://api.apify.com/v2/acts/iJcISG5H8FJUSRoVA/run-sync-get-dataset-items"
-            payload = {
-                "contact_email_exclude_catch_all": True,
-                "contact_email_status_v2": True,
-                "max_result": num_results,
-                "url": query
-            }
-
-            headers = {
-                "Authorization": f"Bearer {self.apify_token}",
-                "Content-Type": "application/json"
-            }
-
-            # Make the request with a longer timeout
-            response = requests.post(url, json=payload, headers=headers, timeout=600)  # 10 minute timeout
-            
-            # Handle both 200 and 400 responses since the scraper might return data even with 400
-            if response.status_code not in [200, 201, 400]:
-                st.error(f"Apollo.io API returned unexpected status code {response.status_code}")
-                return []
-                
+        """Search for profiles using Apify Apollo scraper with API key rotation"""
+        max_retries = len(self.api_key_queue.get_all_keys())
+        
+        for attempt in range(max_retries):
             try:
-                results = response.json()
-
-                # Check if results is empty or not a list
-                if not results:
-                    st.warning("No results returned from Apollo.io. The search might be too narrow or the credits might be exhausted.")
-                    return []
+                current_api_key = self.api_key_queue.get_next_key()
                 
-                # If results is a dict with an error message, check for data
-                if isinstance(results, dict):
-                    if 'data' in results:
-                        results = results['data']
-                    elif 'items' in results:
-                        results = results['items']
-                    else:
-                        st.warning("Unexpected response format from Apollo.io")
-                        return []
-                
-                # Ensure results is a list
-                if not isinstance(results, list):
-                    st.warning("Invalid response format from Apollo.io")
-                    return []
+                if attempt == 0:
+                    st.info(f"🔍 Starting Apollo.io scraping with query: {query}")
+                    progress_bar = st.progress(0)
+                    status_text = st.empty()
+                    status_text.text("⏳ Waiting for Apollo.io scraper to initialize (this may take a few minutes)...")
+                else:
+                    st.warning(f"🔄 Retrying with different API key (attempt {attempt + 1}/{max_retries})")
 
-            except json.JSONDecodeError:
-                st.error("Invalid JSON response from Apollo.io API")
-                return []
+                # Call Apify Apollo scraper
+                url = "https://api.apify.com/v2/acts/iJcISG5H8FJUSRoVA/run-sync-get-dataset-items"
+                payload = {
+                    "contact_email_exclude_catch_all": True,
+                    "contact_email_status_v2": True,
+                    "max_result": num_results,
+                    "url": query
+                }
+
+                headers = {
+                    "Authorization": f"Bearer {current_api_key}",
+                    "Content-Type": "application/json"
+                }
+
+                # Make the request with a longer timeout
+                response = requests.post(url, json=payload, headers=headers, timeout=600)  # 10 minute timeout
             
-            st.success(f"✅ Found {len(results)} profiles from Apollo.io")
+                # Handle both 200 and 400 responses since the scraper might return data even with 400
+                if response.status_code not in [200, 201, 400]:
+                    if response.status_code == 429:
+                        st.warning(f"⚠️ Rate limit hit with API key {attempt + 1}. Trying next key...")
+                        continue
+                    elif response.status_code in [401, 403]:
+                        st.warning(f"⚠️ Authentication failed with API key {attempt + 1}. Trying next key...")
+                        continue
+                    else:
+                        st.error(f"Apollo.io API returned unexpected status code {response.status_code}")
+                        if attempt == max_retries - 1:
+                            return []
+                        continue
+                
+                try:
+                    results = response.json()
 
-            profiles = []
-            for idx, result in enumerate(results):
+                    # Check if results is empty or not a list
+                    if not results:
+                        if attempt == max_retries - 1:
+                            st.warning("No results returned from Apollo.io. The search might be too narrow or the credits might be exhausted.")
+                            return []
+                        continue
+                    
+                    # If results is a dict with an error message, check for data
+                    if isinstance(results, dict):
+                        if 'data' in results:
+                            results = results['data']
+                        elif 'items' in results:
+                            results = results['items']
+                        else:
+                            if attempt == max_retries - 1:
+                                st.warning("Unexpected response format from Apollo.io")
+                                return []
+                            continue
+                    
+                    # Ensure results is a list
+                    if not isinstance(results, list):
+                        if attempt == max_retries - 1:
+                            st.warning("Invalid response format from Apollo.io")
+                            return []
+                        continue
+
+                    st.success(f"✅ Found {len(results)} profiles from Apollo.io using API key {attempt + 1}")
+                    break  # Success, exit the retry loop
+
+                except json.JSONDecodeError:
+                    if attempt == max_retries - 1:
+                        st.error("Invalid JSON response from Apollo.io API")
+                        return []
+                    continue
+                
+            except requests.exceptions.Timeout:
+                st.warning(f"⏱️ Request timeout with API key {attempt + 1}. Trying next key...")
+                if attempt == max_retries - 1:
+                    st.error("All API keys failed due to timeout")
+                    return []
+                continue
+                
+            except requests.exceptions.RequestException as e:
+                st.warning(f"🔌 Request failed with API key {attempt + 1}: {str(e)}")
+                if attempt == max_retries - 1:
+                    st.error(f"All API keys failed: {str(e)}")
+                    return []
+                continue
+                
+            except Exception as e:
+                st.warning(f"❌ Unexpected error with API key {attempt + 1}: {str(e)}")
+                if attempt == max_retries - 1:
+                    st.error(f"All API keys failed with unexpected error: {str(e)}")
+                    return []
+                continue
+        
+        # If we get here, we have successful results
+        profiles = []
+        for idx, result in enumerate(results):
                 try:
                     # Get organization data
                     organization = result.get("organization", {}) or {}
@@ -553,19 +701,15 @@ class LeadScrapingTool:
                     st.warning(f"Error processing profile {idx + 1}: {str(e)}")
                     continue
 
-            progress_bar.empty()
-            status_text.empty()
+        progress_bar.empty()
+        status_text.empty()
+        
+        if profiles:
+            st.success(f"✅ Successfully processed {len(profiles)} Apollo.io profiles")
+        else:
+            st.warning("No profiles could be processed. Please check your search criteria.")
             
-            if profiles:
-                st.success(f"✅ Successfully processed {len(profiles)} Apollo.io profiles")
-            else:
-                st.warning("No profiles could be processed. Please check your search criteria.")
-                
-            return profiles[:num_results]
-
-        except Exception as e:
-            st.error(f"Error in Apollo.io scraping: {str(e)}")
-            return []
+        return profiles[:num_results]
 
     def scrape_leads(self, query_json: str) -> str:
         """Full pipeline: search → save → score → update."""
@@ -1669,7 +1813,11 @@ def create_lead_agent():
     if not sheets_service:
         return None
     
-    scraping_tool = LeadScrapingTool(APIFY_API_TOKEN, sheets_service)
+    if not APIFY_API_TOKENS:
+        st.error("No Apify API tokens configured. Please add at least one token to secrets.")
+        return None
+    
+    scraping_tool = LeadScrapingTool(APIFY_API_TOKENS, sheets_service)
     
     tools = [
         Tool(
@@ -1785,10 +1933,14 @@ def lead_generation_page():
         st.subheader("🔑 API Status")
         api_status = {
             "OpenAI API": bool(OPENAI_API_KEY),
-            "Apollo.io API": bool(APIFY_API_TOKEN),
+            "Apollo.io API": bool(APIFY_API_TOKENS),
             "Google Sheets": bool(GOOGLE_SHEETS_CREDENTIALS),
             "Resend API": bool(RESEND_API_KEY)
         }
+        
+        # Show number of Apify tokens if available
+        if APIFY_API_TOKENS:
+            st.info(f"📊 {len(APIFY_API_TOKENS)} Apify API token(s) configured")
         
         for service, status in api_status.items():
             if status:
@@ -1858,6 +2010,10 @@ def lead_generation_page():
         sheets_service = setup_google_sheets()
         if not sheets_service:
             st.error("Unable to connect to Google Sheets for direct queries. Please check your API configuration.")
+            return
+        
+        if not APIFY_API_TOKENS:
+            st.error("No Apify API tokens configured. Please add at least one token to secrets.")
             return
         
         st.subheader("🔍 Direct Lead Search")
@@ -1959,7 +2115,7 @@ def lead_generation_page():
             })
             
             # Create a scraping tool instance
-            scraping_tool = LeadScrapingTool(APIFY_API_TOKEN, sheets_service)
+            scraping_tool = LeadScrapingTool(APIFY_API_TOKENS, sheets_service)
             
             # Execute the scraping process
             with st.spinner("🔍 Generating leads from Apollo.io..."):
