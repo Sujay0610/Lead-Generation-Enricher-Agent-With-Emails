@@ -15,3 +15,7 @@ python-dotenv
 Authlib
 streamlit-authenticator
 plotly
+python-multipart
+supabase-py
+pydantic
+sentence-transformers
