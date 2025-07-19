@@ -516,11 +516,11 @@ class LeadScrapingTool:
 
     def search_apollo_profiles(self, query: str, num_results: int = 50) -> List[Dict]:
         """Search for profiles using Apify Apollo scraper with API key rotation"""
-        max_retries = len(self.api_key_queue.get_all_keys())
+        max_retries = len(self.token_queue.get_all_keys())
         
         for attempt in range(max_retries):
             try:
-                current_api_key = self.api_key_queue.get_next_key()
+                current_api_key = self.token_queue.get_next_key()
                 
                 if attempt == 0:
                     st.info(f"🔍 Starting Apollo.io scraping with query: {query}")
@@ -886,18 +886,31 @@ class LeadScrapingTool:
                 sheet.append_row(expected_columns)
                 existing_keys = set()
             else:
-                # Verify headers match
+                # Verify headers match - be more flexible with header comparison
                 existing_headers = current_values[0]
-                if existing_headers != expected_columns:
-                    # Clear the sheet and add correct headers
+                # Check if essential columns exist rather than exact match
+                essential_columns = ['linkedin_url', 'fullName', 'email', 'jobTitle', 'companyName']
+                headers_compatible = all(col in existing_headers for col in essential_columns)
+                
+                if not headers_compatible:
+                    # Only clear if essential columns are missing
+                    st.warning("Sheet headers don't contain essential columns. Updating headers...")
                     sheet.clear()
                     sheet.append_row(expected_columns)
                     existing_keys = set()
                 else:
                     # Get existing linkedin_urls for deduplication
                     if len(current_values) > 1:
-                        existing_rows = pd.DataFrame(current_values[1:], columns=existing_headers)
-                        existing_keys = set(existing_rows["linkedin_url"].str.strip().str.lower())
+                        try:
+                            existing_rows = pd.DataFrame(current_values[1:], columns=existing_headers)
+                            linkedin_col = 'linkedin_url' if 'linkedin_url' in existing_headers else None
+                            if linkedin_col:
+                                existing_keys = set(existing_rows[linkedin_col].str.strip().str.lower())
+                            else:
+                                existing_keys = set()
+                        except Exception as e:
+                            st.warning(f"Error processing existing data: {str(e)}")
+                            existing_keys = set()
                     else:
                         existing_keys = set()
 
@@ -922,14 +935,15 @@ class LeadScrapingTool:
                 )
 
             # Generate summary
-            successful_scores = df_to_upload[df_to_upload['scraping_status'] == 'success']
-            if not successful_scores.empty:
-                avg_score = pd.to_numeric(successful_scores['icp_percentage'], errors='coerce').mean()
-                grade_counts = successful_scores['icp_grade'].value_counts().to_dict()
+            if not df_to_upload.empty and 'icp_percentage' in df_to_upload.columns:
+                avg_score = pd.to_numeric(df_to_upload['icp_percentage'], errors='coerce').mean()
+                grade_counts = df_to_upload['icp_grade'].value_counts().to_dict() if 'icp_grade' in df_to_upload.columns else {}
                 
                 summary = f"Successfully appended {len(df_to_upload)} new enriched profiles!\n"
-                summary += f"Average ICP Score: {avg_score:.1f}%\n"
-                summary += f"Grade Distribution: {grade_counts}"
+                if not pd.isna(avg_score):
+                    summary += f"Average ICP Score: {avg_score:.1f}%\n"
+                if grade_counts:
+                    summary += f"Grade Distribution: {grade_counts}"
                 return summary
 
             return f"Successfully appended {len(df_to_upload)} new enriched profiles to Google Sheets!"
@@ -2069,7 +2083,7 @@ def lead_generation_page():
             company_sizes = st.multiselect(
                 "Select company size ranges:",
                 [
-                    "1,10", "11,20", "21,50", "51,100", "101,200"
+                    "1,10", "11,20", "21,50", "51,100", "101,200", "201,500", "501,1000"
                 ],
                 default=["1,10", "11,20", "21,50", "51,100"]
             )
