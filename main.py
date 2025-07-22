@@ -82,6 +82,8 @@ if isinstance(APIFY_API_TOKENS, str):
     APIFY_API_TOKENS = [APIFY_API_TOKENS]
 
 GOOGLE_SHEETS_CREDENTIALS = st.secrets.get("GOOGLE_SHEETS_CREDENTIALS", {})
+GOOGLE_API_KEY = st.secrets.get("GOOGLE_API_KEY", "")
+GOOGLE_CSE_ID = st.secrets.get("GOOGLE_CSE_ID", "")
 RESEND_API_KEY = st.secrets.get("RESEND_API_KEY", "")
 SENDER_EMAIL = st.secrets.get("SENDER_EMAIL", "onboarding@resend.dev")  # Default Resend sender
 
@@ -394,15 +396,19 @@ class EmailManager:
             return {"status": "error", "message": f"Failed to generate email: {str(e)}"}
 
 class LeadScrapingTool:
-    """Enhanced tool for scraping leads with ICP scoring using Apollo.io"""
+    """Enhanced tool for scraping leads with ICP scoring using Apollo.io or Google Search + Apify enrichment"""
 
-    def __init__(self, apify_token_or_tokens, sheets_service):
+    def __init__(self, apify_token_or_tokens, sheets_service, google_api_key=None, cse_id=None):
         self.sheets_service = sheets_service
         if isinstance(apify_token_or_tokens, list):
             self.token_queue = APIKeyQueue(apify_token_or_tokens)
         else:
             self.token_queue = APIKeyQueue([apify_token_or_tokens])
         self.ai_icp_scorer = AIICPScorer(OPENAI_API_KEY)
+        
+        # Google Search API credentials for custom search method
+        self.google_api_key = google_api_key
+        self.cse_id = cse_id
         
         # Initialize or load used keys from session state
         if "used_apify_keys" not in st.session_state:
@@ -513,6 +519,179 @@ class LeadScrapingTool:
         final_url = f"{base_url}?{query_string}"
 
         return final_url
+
+    def search_linkedin_profiles(self, query: str, num_results: int = 20) -> List[Dict]:
+        """Search for LinkedIn profile URLs via Google Custom Search."""
+        results = []
+        start_index = 1
+
+        st.info(f"🔍 Searching for: {query}")
+
+        while len(results) < num_results:
+            try:
+                url = "https://www.googleapis.com/customsearch/v1"
+                params = {
+                    "key": self.google_api_key,
+                    "cx": self.cse_id,
+                    "q": query,
+                    "start": start_index,
+                    "num": min(10, num_results - len(results)),
+                }
+
+                response = requests.get(url, params=params, timeout=30)
+                response.raise_for_status()
+                data = response.json()
+
+                if "items" not in data:
+                    break
+
+                for item in data["items"]:
+                    if "linkedin.com/in/" in item["link"]:
+                        results.append(
+                            {
+                                "title": item.get("title", ""),
+                                "link": item.get("link", ""),
+                                "snippet": item.get("snippet", ""),
+                                "found_at": datetime.now().isoformat(),
+                            }
+                        )
+
+                start_index += 10
+                time.sleep(0.1)
+
+            except Exception as e:
+                st.error(f"Error searching: {str(e)}")
+                break
+
+        st.success(f"✅ Found {len(results)} LinkedIn profiles")
+        return results
+
+    def parse_location(self, location_str: str) -> Dict[str, str]:
+        """Parse location string into city, state, and country components.
+        
+        Examples:
+        - "Calgary, Alberta, Canada" -> {"city": "Calgary", "state": "Alberta", "country": "Canada"}
+        - "Manitoba, Canada" -> {"city": "", "state": "Manitoba", "country": "Canada"}
+        - "Cambridge, Ontario, Canada" -> {"city": "Cambridge", "state": "Ontario", "country": "Canada"}
+        """
+        result = {"city": "", "state": "", "country": ""}
+        
+        if not location_str:
+            return result
+            
+        parts = [part.strip() for part in location_str.split(",")]
+        
+        # Handle different location formats
+        if len(parts) >= 3:
+            # Format: City, State/Province, Country
+            result["city"] = parts[0]
+            result["state"] = parts[1]
+            result["country"] = parts[2]
+        elif len(parts) == 2:
+            # Format: State/Province, Country or City, Country
+            # Assume the last part is always the country
+            result["country"] = parts[1]
+            
+            # For the first part, we'll assume it's a state/province
+            # This is a simplification - in a real system, you might want to
+            # check against a database of known cities vs. states
+            result["state"] = parts[0]
+        elif len(parts) == 1:
+            # Just a country or city name
+            result["country"] = parts[0]
+            
+        return result
+        
+    def enrich_profile_with_apify(self, linkedin_url: str) -> Dict:
+        """Enrich a single LinkedIn profile using Apify."""
+        try:
+            url = (
+                "https://api.apify.com/v2/acts/dev_fusion~linkedin-profile-scraper/"
+                "run-sync-get-dataset-items"
+            )
+            payload = {"profileUrls": [linkedin_url], "maxDelay": 5, "minDelay": 1}
+            headers = {
+                "Authorization": f"Bearer {self.token_queue.get_next_key()}",
+                "Content-Type": "application/json",
+            }
+
+            response = requests.post(url, json=payload, headers=headers, timeout=30)
+            response.raise_for_status()
+            data = response.json()
+
+            if data:
+                profile = data[0]
+                
+                # Parse location into city, state, and country
+                location = profile.get("addressWithCountry", "")
+                location_parts = self.parse_location(location)
+                
+                return {
+                    "linkedin_url": linkedin_url,
+                    "firstName": profile.get("firstName", ""),
+                    "lastName": profile.get("lastName", ""),
+                    "fullName": profile.get("fullName", ""),
+                    "headline": profile.get("headline", ""),
+                    "email": profile.get("email", ""),
+                    "jobTitle": profile.get("jobTitle", ""),
+                    "companyName": profile.get("companyName", ""),
+                    "companyIndustry": profile.get("companyIndustry", ""),
+                    "companyWebsite": profile.get("companyWebsite", ""),
+                    "companyLinkedin": profile.get("companyLinkedin", ""),
+                    "companySize": profile.get("companySize", ""),
+                    "location": location,
+                    "city": location_parts["city"],
+                    "state": location_parts["state"],
+                    "country": location_parts["country"],
+                    "about": profile.get("about", ""),
+                    "experience": json.dumps(profile.get("experiences", [])),
+                    "scraped_at": datetime.now().isoformat(),
+                    "scraping_status": "success"
+                }
+            else:
+                return {
+                    "linkedin_url": linkedin_url,
+                    "scraping_status": "no_data",
+                    "scraped_at": datetime.now().isoformat(),
+                }
+
+        except Exception as e:
+            return {
+                "linkedin_url": linkedin_url,
+                "scraping_status": "error",
+                "error_message": str(e),
+                "scraped_at": datetime.now().isoformat(),
+            }
+
+    def batch_enrich_profiles(self, linkedin_urls: List[str]) -> List[Dict]:
+        """Enrich multiple LinkedIn profiles with ICP scoring."""
+        enriched, total = [], len(linkedin_urls)
+        progress_bar = st.progress(0)
+        status_text = st.empty()
+
+        for i, url in enumerate(linkedin_urls):
+            status_text.text(f"🔍 Enriching profile {i + 1}/{total}: {url}")
+            profile = self.enrich_profile_with_apify(url)
+            
+            # Add ICP scoring if enrichment was successful
+            if profile.get("scraping_status") == "success":
+                icp_score = self.ai_icp_scorer.analyze_profile(profile)
+                profile.update({
+                    "icp_score": icp_score["total_score"],
+                    "icp_percentage": icp_score["score_percentage"],
+                    "icp_grade": icp_score["grade"],
+                    "icp_breakdown": json.dumps(icp_score["breakdown"]),
+                    "send_email_status": "Not Sent"
+                })
+            
+            enriched.append(profile)
+            progress_bar.progress((i + 1) / total)
+
+            if i < total - 1:
+                time.sleep(2)
+
+        status_text.text(f"✅ Completed enriching {total} profiles!")
+        return enriched
 
     def search_apollo_profiles(self, query: str, num_results: int = 50) -> List[Dict]:
         """Search for profiles using Apify Apollo scraper with API key rotation"""
@@ -711,10 +890,10 @@ class LeadScrapingTool:
             
         return profiles[:num_results]
 
-    def scrape_leads(self, query_json: str) -> str:
+    def scrape_leads(self, query_json: str, method: str = "apollo") -> str:
         """Full pipeline: search → save → score → update."""
         try:
-            st.info("🚀 Starting lead generation process...")
+            st.info(f"🚀 Starting lead generation process using {method.upper()} method...")
 
             # Step 1: Parse input and validate
             try:
@@ -724,8 +903,8 @@ class LeadScrapingTool:
                 else:
                     params_data = input_data
 
-                # Add default employee ranges if not specified
-                if isinstance(params_data, dict):
+                # Add default employee ranges if not specified (for Apollo method)
+                if method == "apollo" and isinstance(params_data, dict):
                     if not params_data.get("employee_ranges"):
                         params_data["employee_ranges"] = ["11,20", "21,50", "51,100", "101,200"]
                     if not params_data.get("sort_field"):
@@ -738,16 +917,59 @@ class LeadScrapingTool:
             except json.JSONDecodeError as e:
                 return f"Invalid query JSON: {str(e)}"
 
-            # Step 2: Scrape leads from Apollo
-            st.subheader("🔍 Step 1: Scraping Leads from Apollo")
+            # Step 2: Scrape leads based on selected method
             all_profiles = []
-            for q in params_data:
-                apollo_url = self.generate_apollo_url(q)
-                st.info(f"Generated Apollo.io search URL: {apollo_url}")
+            
+            if method == "apollo":
+                st.subheader("🔍 Step 1: Scraping Leads from Apollo.io")
+                for q in params_data:
+                    apollo_url = self.generate_apollo_url(q)
+                    st.info(f"Generated Apollo.io search URL: {apollo_url}")
+                    
+                    profiles = self.search_apollo_profiles(apollo_url, num_results=st.session_state["leads_per_query"])
+                    if profiles:
+                        all_profiles.extend(profiles)
+            
+            elif method == "google_search":
+                st.subheader("🔍 Step 1: Searching LinkedIn Profiles via Google Search")
                 
-                profiles = self.search_apollo_profiles(apollo_url, num_results=st.session_state["leads_per_query"])
-                if profiles:
-                    all_profiles.extend(profiles)
+                # Check if Google API credentials are available
+                if not self.google_api_key or not self.cse_id:
+                    return "Google Search method requires Google API Key and Custom Search Engine ID. Please configure these in your environment variables."
+                
+                # Generate search queries from the parameters
+                linkedin_urls = []
+                for q in params_data:
+                    job_titles = q.get("job_title", [])
+                    locations = q.get("location", [])
+                    businesses = q.get("business", [])
+                    
+                    # Create search queries combining job titles, locations, and businesses
+                    for job_title in job_titles[:2]:  # Limit to first 2 job titles to avoid too many queries
+                        for location in locations[:2]:  # Limit to first 2 locations
+                            for business in businesses[:1]:  # Limit to first business
+                                search_query = f"{job_title.replace('+', ' ')} {location.replace('+', ' ')} {business.replace('+', ' ')} site:linkedin.com/in/"
+                                
+                                # Search for LinkedIn profiles
+                                search_results = self.search_linkedin_profiles(search_query, num_results=st.session_state["leads_per_query"]) 
+                                for result in search_results:
+                                    linkedin_urls.append(result["link"])
+                
+                # Remove duplicates
+                linkedin_urls = list(set(linkedin_urls))
+                
+                if not linkedin_urls:
+                    return "No LinkedIn profiles found with the given search criteria."
+                
+                # Limit the number of profiles to enrich
+                max_profiles = min(len(linkedin_urls), st.session_state["leads_per_query"])
+                linkedin_urls = linkedin_urls[:max_profiles]
+                
+                st.subheader("🔍 Step 2: Enriching LinkedIn Profiles with Apify")
+                all_profiles = self.batch_enrich_profiles(linkedin_urls)
+            
+            else:
+                return f"Unknown method: {method}. Supported methods are 'apollo' and 'google_search'."
 
             # Flatten all_profiles in case it contains nested lists
             flat_profiles = []
@@ -764,35 +986,40 @@ class LeadScrapingTool:
             total_leads = len(all_profiles)
             
             # Step 3: ICP Scoring
-            st.subheader("🎯 Step 2: ICP Scoring")
-            scored_profiles = []
-            scoring_progress = st.progress(0)
-            scoring_status = st.empty()
-            
-            for idx, profile in enumerate(all_profiles):
-                try:
-                    scoring_status.text(f"Scoring profile {idx + 1}/{total_leads}: {profile.get('fullName', 'Unknown')}")
-                    
-                    # Get ICP score
-                    icp_score = self.ai_icp_scorer.analyze_profile(profile)
-                    
-                    # Update profile with ICP score
-                    profile.update({
-                        "icp_score": icp_score["total_score"],
-                        "icp_percentage": icp_score["score_percentage"],
-                        "icp_grade": icp_score["grade"],
-                        "icp_breakdown": json.dumps(icp_score["breakdown"])
-                    })
+            if method == "apollo":
+                st.subheader("🎯 Step 2: ICP Scoring")
+                scored_profiles = []
+                scoring_progress = st.progress(0)
+                scoring_status = st.empty()
                 
-                    scored_profiles.append(profile)
-                    scoring_progress.progress((idx + 1) / total_leads)
+                for idx, profile in enumerate(all_profiles):
+                    try:
+                        scoring_status.text(f"Scoring profile {idx + 1}/{total_leads}: {profile.get('fullName', 'Unknown')}")
+                        
+                        # Get ICP score
+                        icp_score = self.ai_icp_scorer.analyze_profile(profile)
+                        
+                        # Update profile with ICP score
+                        profile.update({
+                            "icp_score": icp_score["total_score"],
+                            "icp_percentage": icp_score["score_percentage"],
+                            "icp_grade": icp_score["grade"],
+                            "icp_breakdown": json.dumps(icp_score["breakdown"])
+                        })
                     
-                except Exception as e:
-                    st.warning(f"Error scoring profile {idx + 1}: {str(e)}")
-                    continue
-
-            scoring_progress.empty()
-            scoring_status.empty()
+                        scored_profiles.append(profile)
+                        scoring_progress.progress((idx + 1) / total_leads)
+                        
+                    except Exception as e:
+                        st.warning(f"Error scoring profile {idx + 1}: {str(e)}")
+                        continue
+                        
+                scoring_progress.empty()
+                scoring_status.empty()
+            else:
+                # For Google Search method, ICP scoring is already done in batch_enrich_profiles
+                scored_profiles = all_profiles
+                st.subheader("🎯 Step 2: ICP Scoring (Completed during enrichment)")
 
             # Step 4: Update sheets with scores
             st.subheader("📊 Step 3: Updating with ICP Scores")
@@ -806,10 +1033,11 @@ class LeadScrapingTool:
 
             # Final summary
             successful_scores = [p for p in scored_profiles if p.get("icp_score") is not None]
+            method_name = "Apollo.io" if method == "apollo" else "Google Search + Apify"
             summary = (
                 "🎉 **Lead Generation Complete!**\n\n"
                 f"📊 **Results Summary:**\n"
-                f"- Apollo.io profiles found: {total_leads}\n"
+                f"- {method_name} profiles found: {total_leads}\n"
                 f"- Successfully scored: {len(successful_scores)}\n"
             )
             
@@ -1146,6 +1374,8 @@ def email_management_page():
     
     # Filters
     st.subheader("🎯 Filter & Sort Leads")
+    
+    # First row of filters
     col1, col2 = st.columns(2)
     
     with col1:
@@ -1155,6 +1385,48 @@ def email_management_page():
         email_status_filter = st.selectbox(
             "Email Status",
             options=["All", "Sent", "Not Sent"],
+            index=0
+        )
+    
+    # Second row of filters - Geographic filters
+    col3, col4, col5 = st.columns(3)
+    
+    with col3:
+        # Get unique cities for filter options
+        unique_cities = ["All"] + sorted(leads_df['city'].dropna().unique().tolist()) if 'city' in leads_df.columns else ["All"]
+        city_filter = st.selectbox(
+            "🏙️ City",
+            options=unique_cities,
+            index=0
+        )
+    
+    with col4:
+        # Get unique states for filter options
+        unique_states = ["All"] + sorted(leads_df['state'].dropna().unique().tolist()) if 'state' in leads_df.columns else ["All"]
+        state_filter = st.selectbox(
+            "🗺️ State",
+            options=unique_states,
+            index=0
+        )
+    
+    with col5:
+        # Get unique countries for filter options
+        unique_countries = ["All"] + sorted(leads_df['country'].dropna().unique().tolist()) if 'country' in leads_df.columns else ["All"]
+        country_filter = st.selectbox(
+            "🌍 Country",
+            options=unique_countries,
+            index=0
+        )
+    
+    # Third row of filters - Job Title
+    col6, col7 = st.columns([1, 1])
+    
+    with col6:
+        # Get unique job titles for filter options
+        unique_job_titles = ["All"] + sorted(leads_df['jobTitle'].dropna().unique().tolist()) if 'jobTitle' in leads_df.columns else ["All"]
+        job_title_filter = st.selectbox(
+            "👔 Job Title",
+            options=unique_job_titles,
             index=0
         )
     
@@ -1321,6 +1593,42 @@ def email_management_page():
         except Exception as e:
             st.warning(f"Error filtering by email status: {str(e)}")
     
+    # Filter by city
+    if city_filter != "All" and 'city' in filtered_df.columns:
+        try:
+            # Convert to string first to handle non-string values
+            filtered_df['city'] = filtered_df['city'].astype(str)
+            filtered_df = filtered_df[filtered_df['city'] == city_filter]
+        except Exception as e:
+            st.warning(f"Error filtering by city: {str(e)}")
+    
+    # Filter by state
+    if state_filter != "All" and 'state' in filtered_df.columns:
+        try:
+            # Convert to string first to handle non-string values
+            filtered_df['state'] = filtered_df['state'].astype(str)
+            filtered_df = filtered_df[filtered_df['state'] == state_filter]
+        except Exception as e:
+            st.warning(f"Error filtering by state: {str(e)}")
+    
+    # Filter by country
+    if country_filter != "All" and 'country' in filtered_df.columns:
+        try:
+            # Convert to string first to handle non-string values
+            filtered_df['country'] = filtered_df['country'].astype(str)
+            filtered_df = filtered_df[filtered_df['country'] == country_filter]
+        except Exception as e:
+            st.warning(f"Error filtering by country: {str(e)}")
+    
+    # Filter by job title
+    if job_title_filter != "All" and 'jobTitle' in filtered_df.columns:
+        try:
+            # Convert to string first to handle non-string values
+            filtered_df['jobTitle'] = filtered_df['jobTitle'].astype(str)
+            filtered_df = filtered_df[filtered_df['jobTitle'] == job_title_filter]
+        except Exception as e:
+            st.warning(f"Error filtering by job title: {str(e)}")
+    
     # Apply sorting
     try:
         if sort_by == "ICP Score (Best to Worst)" and 'icp_percentage' in filtered_df.columns:
@@ -1333,8 +1641,17 @@ def email_management_page():
     except Exception as e:
         st.warning(f"Error sorting leads: {str(e)}")
     
+    # Display filter summary
+    total_leads = len(leads_df)
+    filtered_leads = len(filtered_df)
+    
+    if filtered_leads < total_leads:
+        st.info(f"📊 Showing {filtered_leads} of {total_leads} leads (filtered)")
+    else:
+        st.info(f"📊 Showing all {total_leads} leads")
+    
     if filtered_df.empty:
-        st.info("No leads match your filters.")
+        st.warning("No leads match your current filters. Try adjusting your filter criteria.")
         return
     
     # Create a container for the leads
@@ -1363,7 +1680,18 @@ def email_management_page():
                     st.markdown(f"**{name}** • {title}")
                     
                 st.markdown(f"🏢 **{company}**")
-                st.markdown(f"🏭 {industry} • 📍 {lead.get('location', 'N/A')}")
+                
+                # Build location string from city, state, country
+                location_parts = []
+                if lead.get('city') and str(lead.get('city')).strip():
+                    location_parts.append(str(lead.get('city')).strip())
+                if lead.get('state') and str(lead.get('state')).strip():
+                    location_parts.append(str(lead.get('state')).strip())
+                if lead.get('country') and str(lead.get('country')).strip():
+                    location_parts.append(str(lead.get('country')).strip())
+                
+                location_display = ', '.join(location_parts) if location_parts else 'N/A'
+                st.markdown(f"🏭 {industry} • 📍 {location_display}")
                 
                 # Add company contact information
                 with st.expander("📞 Company Contact Info"):
@@ -1831,7 +2159,7 @@ def create_lead_agent():
         st.error("No Apify API tokens configured. Please add at least one token to secrets.")
         return None
     
-    scraping_tool = LeadScrapingTool(APIFY_API_TOKENS, sheets_service)
+    scraping_tool = LeadScrapingTool(APIFY_API_TOKENS, sheets_service, GOOGLE_API_KEY, GOOGLE_CSE_ID)
     
     tools = [
         Tool(
@@ -1909,8 +2237,7 @@ def main():
     if page == "🎯 Lead Generation":
         lead_generation_page()
     elif page == "📧 Email Management":
-        import asyncio
-        asyncio.run(email_management_page())
+        email_management_page()
     elif page == "📊 Email Dashboard":
         email_dashboard_page()
     elif page == "⚙️ ICP Configuration":
@@ -1948,6 +2275,7 @@ def lead_generation_page():
         api_status = {
             "OpenAI API": bool(OPENAI_API_KEY),
             "Apollo.io API": bool(APIFY_API_TOKENS),
+            "Google Search API": bool(GOOGLE_API_KEY and GOOGLE_CSE_ID),
             "Google Sheets": bool(GOOGLE_SHEETS_CREDENTIALS),
             "Resend API": bool(RESEND_API_KEY)
         }
@@ -1964,11 +2292,17 @@ def lead_generation_page():
         
         st.markdown("---")
         st.markdown("### How to use:")
+        st.markdown("**Chat Interface:**")
         st.markdown("1. Start by saying 'Hi' to Lead Generation Joe")
         st.markdown("2. Provide locations, businesses, and job titles")
-        st.markdown("3. Joe will automatically:")
-        st.markdown("   - 🔍 Search Google for LinkedIn profiles")
-        st.markdown("   - 🤖 Enrich profiles with Apify scraper")
+        st.markdown("3. Joe will automatically process and save leads")
+        st.markdown("")
+        st.markdown("**Direct Query Form:**")
+        st.markdown("1. Choose between Apollo.io or Google Search method")
+        st.markdown("2. Fill in job titles, locations, and industries")
+        st.markdown("3. System will automatically:")
+        st.markdown("   - 🔍 Search for LinkedIn profiles")
+        st.markdown("   - 🤖 Enrich profiles with data")
         st.markdown("   - 🎯 Score leads based on ICP criteria")
         st.markdown("   - 💾 Save all data to Google Sheets")
         st.markdown("4. Use the Email Management page to send cold emails")
@@ -2032,17 +2366,26 @@ def lead_generation_page():
         
         st.subheader("🔍 Direct Lead Search")
         st.markdown("""
-        Specify your search criteria to generate leads directly from Apollo.io:
+        Specify your search criteria to generate leads using Apollo.io or Google Search + Apify enrichment:
         
-        1. Select job titles, locations, and industries from the dropdown menus
-        2. Add custom values if needed
-        3. Choose company size ranges
-        4. Click 'Generate Leads' to start the search
+        1. Choose your lead generation method
+        2. Select job titles, locations, and industries from the dropdown menus
+        3. Add custom values if needed
+        4. Choose company size ranges
+        5. Click 'Generate Leads' to start the search
         
         Each search will retrieve up to 25 leads. For best results, use specific locations and job titles.
         """)
         
         with st.form("direct_lead_search_form"):
+            # Method Selection
+            st.subheader("🔧 Lead Generation Method")
+            method = st.radio(
+                "Choose your lead generation method:",
+                ["Apollo.io", "Google Search + Apify Enrichment"],
+                help="Apollo.io: Fast, structured data from Apollo's database. Google Search: Custom search with Apify enrichment."
+            )
+            
             # Job Title(s) - Multi-select with common options and custom input
             st.subheader("👔 Job Titles")
             preset_titles = st.multiselect(
@@ -2129,12 +2472,21 @@ def lead_generation_page():
             })
             
             # Create a scraping tool instance
-            scraping_tool = LeadScrapingTool(APIFY_API_TOKENS, sheets_service)
+            scraping_tool = LeadScrapingTool(APIFY_API_TOKENS, sheets_service, GOOGLE_API_KEY, GOOGLE_CSE_ID)
+            
+            # Determine method parameter
+            method_param = "apollo" if method == "Apollo.io" else "google_search"
+            
+            # Check if required credentials are available for the selected method
+            if method_param == "google_search" and (not GOOGLE_API_KEY or not GOOGLE_CSE_ID):
+                st.error("❌ Google Search method requires Google API Key and Custom Search Engine ID. Please add them to your secrets.")
+                return
             
             # Execute the scraping process
-            with st.spinner("🔍 Generating leads from Apollo.io..."):
+            method_display = "Apollo.io" if method_param == "apollo" else "Google Search + Apify"
+            with st.spinner(f"🔍 Generating leads using {method_display}..."):
                 try:
-                    result = scraping_tool.scrape_leads(query_json)
+                    result = scraping_tool.scrape_leads(query_json, method=method_param)
                     st.success("✅ Lead generation completed!")
                     st.markdown(result)
                 except Exception as e:
