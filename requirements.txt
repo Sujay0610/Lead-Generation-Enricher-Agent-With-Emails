@@ -15,4 +15,5 @@ Authlib
 streamlit-authenticator
 plotly
 supabase
+supabase-py
 pydantic
