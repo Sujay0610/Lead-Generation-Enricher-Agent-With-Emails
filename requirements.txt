@@ -16,6 +16,6 @@ Authlib
 streamlit-authenticator
 plotly
 python-multipart
-supabase
+supabase-py
 pydantic
 sentence-transformers
