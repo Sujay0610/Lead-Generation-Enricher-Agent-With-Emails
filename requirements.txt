@@ -14,5 +14,5 @@ python-dotenv
 Authlib
 streamlit-authenticator
 plotly
-supabase-py
+supabase
 pydantic
