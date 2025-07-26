@@ -2543,9 +2543,9 @@ def main():
     
     if page == "🎯 Lead Generation":
         lead_generation_page()
-    elif page == "📊 Leads Database":
+    elif page == "🗃️ Leads Database":
         leads_database_page()
-    elif page == "📧 Email Management":
+    elif page == "📝 Google sheets":
         email_management_page()
     elif page == "📊 Email Dashboard":
         email_dashboard_page()
