@@ -12,7 +12,7 @@ from langchain.memory import ConversationBufferMemory
 from langchain_community.callbacks.streamlit import StreamlitCallbackHandler
 import requests
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 import gspread
 from google.oauth2.service_account import Credentials
 import os
@@ -21,7 +21,7 @@ from langgraph.checkpoint.memory import MemorySaver
 import hashlib
 from supabase import create_client
 import asyncio
-from email_template_manager import EmailTemplateManager
+from simple_email_manager import SimpleEmailManager
 from collections import deque
 
 class APIKeyQueue:
@@ -413,6 +413,9 @@ class LeadScrapingTool:
         # Initialize or load used keys from session state
         if "used_apify_keys" not in st.session_state:
             st.session_state.used_apify_keys = set()
+        # Handle case where used_apify_keys might be None
+        if st.session_state.used_apify_keys is None:
+            st.session_state.used_apify_keys = set()
         self.used_keys = st.session_state.used_apify_keys
         
         # Track total available keys
@@ -425,10 +428,28 @@ class LeadScrapingTool:
         # Initialize or load exhausted keys from session state
         if "exhausted_apify_keys" not in st.session_state:
             st.session_state.exhausted_apify_keys = set()
+        # Handle case where exhausted_apify_keys might be None
+        if st.session_state.exhausted_apify_keys is None:
+            st.session_state.exhausted_apify_keys = set()
         self.exhausted_keys = st.session_state.exhausted_apify_keys
+        
+        # Initialize Supabase client
+        try:
+            self.supabase = create_client(
+                st.secrets["SUPABASE_URL"],
+                st.secrets["SUPABASE_SERVICE_ROLE_KEY"]
+            )
+        except Exception as e:
+            st.warning(f"Failed to initialize Supabase client: {str(e)}")
+            self.supabase = None
 
     def get_next_unused_key(self):
         """Get the next unused API key. If all keys have been used, reset and start over."""
+        # Initialize exhausted_keys if it's None
+        if self.exhausted_keys is None:
+            self.exhausted_keys = set()
+            st.session_state.exhausted_apify_keys = self.exhausted_keys
+            
         # If all keys have been used, reset the used keys tracking
         if len(self.used_keys) >= self.total_keys:
             st.warning("⚠️ All API keys have been used today. Resetting usage tracking.")
@@ -456,6 +477,10 @@ class LeadScrapingTool:
         
     def mark_key_exhausted(self, key):
         """Mark a key as exhausted for the day"""
+        # Initialize exhausted_keys if it's None
+        if self.exhausted_keys is None:
+            self.exhausted_keys = set()
+            
         if key not in self.exhausted_keys:
             self.exhausted_keys.add(key)
             st.session_state.exhausted_apify_keys = self.exhausted_keys
@@ -524,8 +549,9 @@ class LeadScrapingTool:
         """Search for LinkedIn profile URLs via Google Custom Search."""
         results = []
         start_index = 1
+        total_search_results = 0
 
-        st.info(f"🔍 Searching for: {query}")
+        st.info(f"🔍 Searching Google for: {query}")
 
         while len(results) < num_results:
             try:
@@ -542,11 +568,23 @@ class LeadScrapingTool:
                 response.raise_for_status()
                 data = response.json()
 
+                # Debug: Show API response info
+                if "searchInformation" in data:
+                    total_results = data["searchInformation"].get("totalResults", "0")
+                    st.info(f"📊 Google found {total_results} total results for this query")
+
                 if "items" not in data:
+                    st.warning(f"⚠️ No search results found in Google response")
                     break
+
+                # Count all search results and LinkedIn profiles separately
+                search_batch_size = len(data["items"])
+                total_search_results += search_batch_size
+                linkedin_count_in_batch = 0
 
                 for item in data["items"]:
                     if "linkedin.com/in/" in item["link"]:
+                        linkedin_count_in_batch += 1
                         results.append(
                             {
                                 "title": item.get("title", ""),
@@ -556,14 +594,28 @@ class LeadScrapingTool:
                             }
                         )
 
+                st.info(f"📋 Batch {start_index//10 + 1}: Found {linkedin_count_in_batch} LinkedIn profiles out of {search_batch_size} search results")
+
+                # If no more results available, break
+                if search_batch_size < 10:
+                    break
+
                 start_index += 10
                 time.sleep(0.1)
 
             except Exception as e:
-                st.error(f"Error searching: {str(e)}")
+                st.error(f"❌ Error during Google search: {str(e)}")
+                if "quota" in str(e).lower():
+                    st.error("🚫 Google API quota exceeded. Please check your API limits.")
+                elif "invalid" in str(e).lower():
+                    st.error("🔑 Invalid Google API credentials. Please check your API key and CSE ID.")
                 break
 
-        st.success(f"✅ Found {len(results)} LinkedIn profiles")
+        if results:
+            st.success(f"✅ Found {len(results)} LinkedIn profiles from {total_search_results} total search results")
+        else:
+            st.warning(f"⚠️ No LinkedIn profiles found despite {total_search_results} total search results. Try broader search terms.")
+        
         return results
 
     def parse_location(self, location_str: str) -> Dict[str, str]:
@@ -714,6 +766,7 @@ class LeadScrapingTool:
                 payload = {
                     "contact_email_exclude_catch_all": True,
                     "contact_email_status_v2": True,
+                    "include_email": True,
                     "max_result": num_results,
                     "url": query
                 }
@@ -888,9 +941,9 @@ class LeadScrapingTool:
         else:
             st.warning("No profiles could be processed. Please check your search criteria.")
             
-        return profiles[:num_results]
+        return profiles  # Return all profiles without limiting
 
-    def scrape_leads(self, query_json: str, method: str = "apollo") -> str:
+    def scrape_leads(self, query_json: str, method: str = "apollo", num_results: int = 20) -> str:
         """Full pipeline: search → save → score → update."""
         try:
             st.info(f"🚀 Starting lead generation process using {method.upper()} method...")
@@ -899,9 +952,23 @@ class LeadScrapingTool:
             try:
                 input_data = json.loads(query_json)
                 if isinstance(input_data, dict) and "query" in input_data and isinstance(input_data["query"], list):
-                    params_data = input_data["query"][0]
+                    # Get the first non-None element from the query list
+                    query_list = input_data["query"]
+                    params_data = None
+                    for item in query_list:
+                        if item is not None:
+                            params_data = item
+                            break
+                    
+                    # If no valid item found, use empty dict
+                    if params_data is None:
+                        params_data = {}
                 else:
                     params_data = input_data
+
+                # Ensure params_data is not None
+                if params_data is None:
+                    params_data = {}
 
                 # Add default employee ranges if not specified (for Apollo method)
                 if method == "apollo" and isinstance(params_data, dict):
@@ -914,6 +981,14 @@ class LeadScrapingTool:
 
                 if not isinstance(params_data, list):
                     params_data = [params_data]
+                    
+                # Filter out None values from the list
+                params_data = [item for item in params_data if item is not None and isinstance(item, dict)]
+                
+                # If no valid data after filtering, return error
+                if not params_data:
+                    return "No valid query parameters found. Please check your input data."
+                    
             except json.JSONDecodeError as e:
                 return f"Invalid query JSON: {str(e)}"
 
@@ -926,7 +1001,7 @@ class LeadScrapingTool:
                     apollo_url = self.generate_apollo_url(q)
                     st.info(f"Generated Apollo.io search URL: {apollo_url}")
                     
-                    profiles = self.search_apollo_profiles(apollo_url, num_results=st.session_state["leads_per_query"])
+                    profiles = self.search_apollo_profiles(apollo_url, num_results=num_results)
                     if profiles:
                         all_profiles.extend(profiles)
             
@@ -944,16 +1019,35 @@ class LeadScrapingTool:
                     locations = q.get("location", [])
                     businesses = q.get("business", [])
                     
-                    # Create search queries combining job titles, locations, and businesses
-                    for job_title in job_titles[:2]:  # Limit to first 2 job titles to avoid too many queries
-                        for location in locations[:2]:  # Limit to first 2 locations
-                            for business in businesses[:1]:  # Limit to first business
-                                search_query = f"{job_title.replace('+', ' ')} {location.replace('+', ' ')} {business.replace('+', ' ')} site:linkedin.com/in/"
-                                
-                                # Search for LinkedIn profiles
-                                search_results = self.search_linkedin_profiles(search_query, num_results=st.session_state["leads_per_query"]) 
-                                for result in search_results:
-                                    linkedin_urls.append(result["link"])
+
+                    
+                    # Since we now have single values in lists, take the first (and only) item
+                    job_title = job_titles[0] if job_titles else ""
+                    location = locations[0] if locations else ""
+                    business = businesses[0] if businesses else ""
+                    
+                    # Create search terms list (only include non-empty terms)
+                    search_terms = []
+                    if job_title:
+                        search_terms.append(job_title.replace('+', ' '))
+                    if location:
+                        search_terms.append(location.replace('+', ' '))
+                    if business:
+                        search_terms.append(business.replace('+', ' '))
+                    
+                    # Only proceed if we have at least one search term
+                    if search_terms:
+                        # Create a search query with available terms
+                        search_query = f"{' '.join(search_terms)} site:linkedin.com/in/"
+                        
+                        st.info(f"🔍 Searching for: {search_query}")
+                        
+                        # Search for LinkedIn profiles
+                        search_results = self.search_linkedin_profiles(search_query, num_results=num_results)
+                        for result in search_results:
+                            linkedin_urls.append(result["link"])
+                    else:
+                        st.warning("⚠️ No valid search terms found in query parameters")
                 
                 # Remove duplicates
                 linkedin_urls = list(set(linkedin_urls))
@@ -961,9 +1055,8 @@ class LeadScrapingTool:
                 if not linkedin_urls:
                     return "No LinkedIn profiles found with the given search criteria."
                 
-                # Limit the number of profiles to enrich
-                max_profiles = min(len(linkedin_urls), st.session_state["leads_per_query"])
-                linkedin_urls = linkedin_urls[:max_profiles]
+                # Process all found LinkedIn URLs without limiting
+                st.info(f"Found {len(linkedin_urls)} unique LinkedIn profiles to enrich")
                 
                 st.subheader("🔍 Step 2: Enriching LinkedIn Profiles with Apify")
                 all_profiles = self.batch_enrich_profiles(linkedin_urls)
@@ -1021,15 +1114,26 @@ class LeadScrapingTool:
                 scored_profiles = all_profiles
                 st.subheader("🎯 Step 2: ICP Scoring (Completed during enrichment)")
 
-            # Step 4: Update sheets with scores
+            # Step 4: Update sheets and Supabase with scores
             st.subheader("📊 Step 3: Updating with ICP Scores")
             if scored_profiles:
                 try:
+                    # Save to Google Sheets
                     final_save_msg = self.save_enriched_data_to_sheets(scored_profiles)
                     st.success("✅ ICP scores saved to Google Sheets")
+                    
+                    # Save to Supabase
+                    supabase_result = self.save_enriched_data_to_supabase(scored_profiles)
+                    if supabase_result["status"] == "success":
+                        st.success(f"✅ {supabase_result['message']}")
+                    else:
+                        st.warning(f"⚠️ {supabase_result['message']}")
+                        
+
+                        
                 except Exception as e:
                     st.error(f"Error saving ICP scores: {str(e)}")
-                    return "Failed to save ICP scores to Google Sheets"
+                    return "Failed to save ICP scores to Google Sheets and Supabase"
 
             # Final summary
             successful_scores = [p for p in scored_profiles if p.get("icp_score") is not None]
@@ -1057,6 +1161,204 @@ class LeadScrapingTool:
             import traceback, sys
             traceback.print_exc(file=sys.stderr)
             return f"Error in lead generation process: {str(e)}"
+            
+    def map_profile_fields_to_db(self, profile: Dict) -> Dict:
+        """Map camelCase profile fields to snake_case database column names."""
+        # Field mapping from camelCase (Apollo/Apify) to snake_case (database)
+        field_mapping = {
+            'fullName': 'full_name',
+            'firstName': 'first_name', 
+            'lastName': 'last_name',
+            'jobTitle': 'job_title',
+            'companyName': 'company_name',
+            'companyDomain': 'company_domain',
+            'companyIndustry': 'company_industry',
+            'companySize': 'company_size',
+            'companyWebsite': 'company_website',
+            'companyLinkedIn': 'company_linkedin',
+            'companyLinkedin': 'company_linkedin',  # Handle both variations
+            'companyTwitter': 'company_twitter',
+            'companyFacebook': 'company_facebook',
+            'companyPhone': 'company_phone',
+            'companyFoundedYear': 'company_founded_year',
+            'companyFoundedIn': 'company_founded_year',  # Handle LinkedIn variation
+            'companyGrowth6Month': 'company_growth_6month',
+            'companyGrowth12Month': 'company_growth_12month',
+            'companyGrowth24Month': 'company_growth_24month',
+            'linkedinUrl': 'linkedin_url',
+            'linkedin_url': 'linkedin_url',
+            'emailAddress': 'email_address',
+            'phoneNumber': 'phone_number',
+            'mobileNumber': 'phone_number',  # Handle LinkedIn variation
+            'photo_url': 'photo_url',
+            'profilePic': 'photo_url',  # Handle LinkedIn variation
+            'profilePicHighQuality': 'photo_url',  # Use high quality if available
+            'work_experience_months': 'work_experience_months',
+            'employment_history': 'employment_history',
+            'intent_strength': 'intent_strength',
+            'show_intent': 'show_intent',
+            'email_domain_catchall': 'email_domain_catchall',
+            'revealed_for_current_team': 'revealed_for_current_team',
+            'icpScore': 'icp_score',
+            'icpGrade': 'icp_grade', 
+            'icpPercentage': 'icp_percentage',
+            'icpBreakdown': 'icp_breakdown',
+            'icp_score': 'icp_score',
+            'icp_grade': 'icp_grade',
+            'icp_percentage': 'icp_percentage',
+            'icp_breakdown': 'icp_breakdown',
+            'createdAt': 'created_at',
+            # LinkedIn enrichment specific fields
+            'about': 'about',
+            'headline': 'headline',
+            'experiences': 'experience',  # Map experiences array to experience JSON field
+            'connections': 'connections',  # This might not be in DB schema, will be filtered out
+            'followers': 'followers',  # This might not be in DB schema, will be filtered out
+            'currentJobDuration': 'current_job_duration',  # This might not be in DB schema
+            'currentJobDurationInYrs': 'current_job_duration_years',  # This might not be in DB schema
+            'topSkillsByEndorsements': 'top_skills',  # This might not be in DB schema
+            'addressCountryOnly': 'country',
+            'addressWithCountry': 'location',
+            'addressWithoutCountry': 'location',
+            'publicIdentifier': 'public_identifier',  # This might not be in DB schema
+            'openConnection': 'open_connection',  # This might not be in DB schema
+            'urn': 'linkedin_urn'  # This might not be in DB schema
+        }
+        
+        mapped_profile = {}
+        for key, value in profile.items():
+            # Use mapped field name if available, otherwise use original key in snake_case
+            db_field = field_mapping.get(key, key)
+            
+            # Special handling for specific fields
+            if key == 'profilePicHighQuality' and value and 'profilePic' in profile:
+                # Prefer high quality profile pic over regular one
+                db_field = 'photo_url'
+            elif key == 'profilePic' and 'profilePicHighQuality' in profile and profile['profilePicHighQuality']:
+                # Skip regular profile pic if high quality is available
+                continue
+            
+            # Convert lists and dicts to JSON strings
+            if isinstance(value, (list, dict)):
+                mapped_profile[db_field] = json.dumps(value)
+            # Convert None to empty string for text fields
+            elif value is None:
+                mapped_profile[db_field] = ""
+            # Handle string values that might contain backticks (clean them)
+            elif isinstance(value, str):
+                # Remove backticks and extra spaces from URLs and other string fields
+                cleaned_value = value.strip().strip('`').strip()
+                mapped_profile[db_field] = cleaned_value
+            # Keep other values as is
+            else:
+                mapped_profile[db_field] = value
+                
+        return mapped_profile
+    
+    def get_valid_db_columns(self):
+        """Get list of valid columns from the leads table schema."""
+        # Define the current leads table schema columns based on the complete migration
+        # This matches the 20241201_create_complete_leads_table.sql schema
+        base_columns = {
+            'id', 'linkedin_url', 'full_name', 'first_name', 'last_name', 'headline', 'about',
+            'email', 'email_address', 'email_status', 'phone_number', 'job_title', 'seniority',
+            'departments', 'subdepartments', 'functions', 'work_experience_months', 'employment_history',
+            'location', 'city', 'state', 'country', 'company_name', 'company_website', 'company_domain',
+            'company_linkedin', 'company_twitter', 'company_facebook', 'company_phone', 'company_size',
+            'company_industry', 'company_founded_year', 'company_growth_6month', 'company_growth_12month',
+            'company_growth_24month', 'photo_url', 'experience', 'intent_strength', 'show_intent',
+            'email_domain_catchall', 'revealed_for_current_team', 'icp_score', 'icp_percentage',
+            'icp_grade', 'icp_breakdown', 'send_email_status', 'scraping_status', 'error_message',
+            'scraped_at', 'created_at', 'updated_at'
+        }
+        
+        # Additional columns that might be added in future or custom implementations
+        # These will be filtered out gracefully if they don't exist
+        extended_columns = {
+            'connections', 'followers', 'current_job_duration', 'current_job_duration_years',
+            'top_skills', 'public_identifier', 'open_connection', 'linkedin_urn'
+        }
+        
+        return base_columns.union(extended_columns)
+
+    def save_enriched_data_to_supabase(self, enriched_data: List[Dict]) -> Dict:
+        """Save enriched data to Supabase leads table with graceful handling of missing columns."""
+        if not enriched_data:
+            return {"status": "warning", "message": "No enriched data to save to Supabase."}
+            
+        if not self.supabase:
+            return {"status": "warning", "message": "Supabase client not initialized. Data saved only to Google Sheets."}
+            
+        try:
+            # Get valid database columns
+            valid_columns = self.get_valid_db_columns()
+            
+            # Track stats for summary
+            total_leads = len(enriched_data)
+            successful_inserts = 0
+            duplicate_leads = 0
+            failed_inserts = 0
+            skipped_fields = set()
+            
+            for profile in enriched_data:
+                try:
+                    # Map profile fields to database column names
+                    clean_profile = self.map_profile_fields_to_db(profile)
+                    
+                    # Filter out fields that don't exist in the database schema
+                    filtered_profile = {}
+                    for key, value in clean_profile.items():
+                        if key in valid_columns:
+                            filtered_profile[key] = value
+                        else:
+                            skipped_fields.add(key)
+                    
+                    # Add created_at timestamp if not present
+                    if "created_at" not in filtered_profile:
+                        filtered_profile["created_at"] = datetime.now().isoformat()
+                        
+                    # Insert data into Supabase
+                    result = self.supabase.table("leads").insert(filtered_profile).execute()
+                    
+                    # Check if insert was successful
+                    if result.data:
+                        successful_inserts += 1
+                    else:
+                        failed_inserts += 1
+                        
+                except Exception as profile_e:
+                    # Check if it's a duplicate key violation
+                    if "duplicate key" in str(profile_e).lower() or "unique constraint" in str(profile_e).lower():
+                        duplicate_leads += 1
+                    else:
+                        failed_inserts += 1
+                        st.warning(f"Error inserting profile: {str(profile_e)}")
+            
+            # Generate summary message
+            message = f"Saved {successful_inserts} new leads to Supabase"
+            if duplicate_leads > 0:
+                message += f", {duplicate_leads} duplicates skipped"
+            if failed_inserts > 0:
+                message += f", {failed_inserts} failed"
+            if skipped_fields:
+                st.info(f"Note: Skipped fields not in database schema: {', '.join(sorted(skipped_fields))}")
+                
+            return {
+                "status": "success" if successful_inserts > 0 else "warning",
+                "message": message,
+                "stats": {
+                    "total": total_leads,
+                    "successful": successful_inserts,
+                    "duplicates": duplicate_leads,
+                    "failed": failed_inserts,
+                    "skipped_fields": list(skipped_fields)
+                }
+            }
+                
+        except Exception as e:
+            return {"status": "warning", "message": f"Error saving to Supabase: {str(e)}"}
+    
+
 
     def save_enriched_data_to_sheets(self, enriched_data: List[Dict], sheet_name: str = "Sheet1") -> str:
         """Append enriched data to Google Sheets with ICP scoring."""
@@ -1758,7 +2060,7 @@ def email_management_page():
                                 with st.spinner("Generating from template..."):
                                     try:
                                         # Get templates and generate email
-                                        template_manager = EmailTemplateManager()
+                                        template_manager = SimpleEmailManager()
                                         templates = asyncio.run(template_manager.retrieve_templates(persona, stage))
                                         if templates:
                                             result = asyncio.run(template_manager.generate_email(lead, templates))
@@ -1782,7 +2084,7 @@ def email_management_page():
                             if st.button("💾 Save Email", key=f"save_{idx}"):
                                 with st.spinner("Saving email..."):
                                     try:
-                                        template_manager = EmailTemplateManager()
+                                        template_manager = SimpleEmailManager()
                                         # Save the draft first
                                         draft_result = asyncio.run(template_manager.save_draft(
                                             lead_id=lead.get('linkedin_url', ''),  # Using LinkedIn URL as lead_id
@@ -1813,7 +2115,7 @@ def email_management_page():
                                         st.error(f"Error saving email: {str(e)}")
                         
                         # Show drafts if available
-                        # drafts = asyncio.run(EmailTemplateManager().get_drafts(lead.get('linkedin_url', '')))
+                        # drafts = asyncio.run(SimpleEmailManager().get_drafts(lead.get('linkedin_url', '')))
                         # if drafts:
                         #     with st.expander("📋 Saved Emails"):
                         #         for draft in drafts:
@@ -2161,11 +2463,16 @@ def create_lead_agent():
     
     scraping_tool = LeadScrapingTool(APIFY_API_TOKENS, sheets_service, GOOGLE_API_KEY, GOOGLE_CSE_ID)
     
+    def scrape_leads_with_config(query_json: str, method: str = "apollo") -> str:
+        """Wrapper function to include leads_per_query from session state"""
+        leads_per_query = st.session_state.get("leads_per_query", 20)
+        return scraping_tool.scrape_leads(query_json, method, num_results=leads_per_query)
+    
     tools = [
         Tool(
             name="leadScraping",
             description="Use this tool to scrape leads into a Google Sheet. Only call this tool once you have enough information to complete the desired JSON search query.",
-            func=scraping_tool.scrape_leads
+            func=scrape_leads_with_config
         )
     ]
     
@@ -2231,11 +2538,13 @@ def main():
     st.sidebar.title("Navigation")
     page = st.sidebar.selectbox(
         "Choose a page",
-        ["🎯 Lead Generation", "📧 Email Management", "📊 Email Dashboard", "⚙️ ICP Configuration"]
+        ["🎯 Lead Generation", "🗃️ Leads Database", "📝 Google sheets", "📊 Email Dashboard", "⚙️ ICP Configuration"]
     )
     
     if page == "🎯 Lead Generation":
         lead_generation_page()
+    elif page == "📊 Leads Database":
+        leads_database_page()
     elif page == "📧 Email Management":
         email_management_page()
     elif page == "📊 Email Dashboard":
@@ -2248,13 +2557,15 @@ def lead_generation_page():
     st.title("🎯 Lead Generation System")
     st.markdown("Powered by AI Agent + Web Scraping + Data Enrichment + ICP Scoring")
     
+    # Lead Generation content (removed query history tab)
+    
     # Add a toggle for input method
     input_method = st.radio(
         "Choose input method:",
-        ["Chat with Lead Generation Joe", "Direct Query Form"],
+        [ "Direct Query Form","Chat with Lead Generation Joe"],
         horizontal=True
     )
-    
+
     # Sidebar for configuration
     with st.sidebar:
         st.header("Configuration")
@@ -2263,12 +2574,12 @@ def lead_generation_page():
         st.subheader("🎯 Query Settings")
         leads_per_query = st.selectbox(
             "Leads per search query",
-            options=[20, 25, 50, 100],
+            options=[1, 5, 10, 20, 25, 50, 100],
             index=3,  # Default to 20
             help="Number of LinkedIn profiles to fetch per search query. More leads = longer processing time."
         )
         st.session_state["leads_per_query"] = leads_per_query
-        
+    
         # API Key checks
         st.markdown("---")
         st.subheader("🔑 API Status")
@@ -2289,7 +2600,7 @@ def lead_generation_page():
                 st.success(f"✅ {service}")
             else:
                 st.error(f"❌ {service} - Please add to secrets")
-        
+    
         st.markdown("---")
         st.markdown("### How to use:")
         st.markdown("**Chat Interface:**")
@@ -2321,6 +2632,7 @@ def lead_generation_page():
         st.session_state.messages = []
     if "agent" not in st.session_state:
         st.session_state.agent = create_lead_agent()
+
     
     # Chat-based interface
     if input_method == "Chat with Lead Generation Joe":
@@ -2374,7 +2686,7 @@ def lead_generation_page():
         4. Choose company size ranges
         5. Click 'Generate Leads' to start the search
         
-        Each search will retrieve up to 25 leads. For best results, use specific locations and job titles.
+        For best results, use specific locations and job titles.
         """)
         
         with st.form("direct_lead_search_form"):
@@ -2382,86 +2694,86 @@ def lead_generation_page():
             st.subheader("🔧 Lead Generation Method")
             method = st.radio(
                 "Choose your lead generation method:",
-                ["Apollo.io", "Google Search + Apify Enrichment"],
+                ["Google Search + Apify Enrichment","Apollo.io"],
                 help="Apollo.io: Fast, structured data from Apollo's database. Google Search: Custom search with Apify enrichment."
             )
             
-            # Job Title(s) - Multi-select with common options and custom input
-            st.subheader("👔 Job Titles")
-            preset_titles = st.multiselect(
-                "Select job titles:",
+            # Job Title - Single select with common options and custom input
+            st.subheader("👔 Job Title (Select One)")
+            preset_title = st.selectbox(
+                "Select a job title:",
                 [
+                    "-- Select from list --",
                     "Operations Head", "Operations Manager", "Plant Manager", "Production Engineer",
                     "Facility Manager", "Service Head", "Asset Manager",
                     "Maintenance Manager", "Operations Director", "COO"
                 ]
             )
             
-            custom_title = st.text_input("Add custom job title:", "")
+            custom_title = st.text_input("Or enter custom job title:", "")
             
-            # Location(s) - Multi-select with common options and custom input
-            st.subheader("📍 Locations")
-            preset_locations = st.multiselect(
-                "Select locations:",
+            # Location - Single select with common options and custom input
+            st.subheader("📍 Location (Select One)")
+            preset_location = st.selectbox(
+                "Select a location:",
                 [
+                    "-- Select from list --",
                     "United States", "Canada", "United Kingdom", "Australia", "Singapore", "India"
                 ]
             )
             
-            custom_location = st.text_input("Add custom location:", "")
+            custom_location = st.text_input("Or enter custom location:", "")
             
-            # Industries - Multi-select with common options and custom input
-            st.subheader("🏭 Industries")
-            preset_industries = st.multiselect(
-                "Select industries:",
+            # Industry - Single select with common options and custom input
+            st.subheader("🏭 Industry (Select One)")
+            preset_industry = st.selectbox(
+                "Select an industry:",
                 [
+                    "-- Select from list --",
                     "Manufacturing", "Industrial Automation", "Consumer Electronics"
                 ]
             )
             
-            custom_industry = st.text_input("Add custom industry:", "")
+            custom_industry = st.text_input("Or enter custom industry:", "")
             
-            # Company Size - Multi-select of ranges
-            st.subheader("🏢 Company Size")
-            company_sizes = st.multiselect(
-                "Select company size ranges:",
-                [
-                    "1,10", "11,20", "21,50", "51,100", "101,200", "201,500", "501,1000"
-                ],
-                default=["1,10", "11,20", "21,50", "51,100"]
-            )
+            # Company Size - Only for Apollo method
+            company_sizes = []
+            try:
+                st.info("ℹ️ Company size filtering is not available for Google Search method.")
+                st.subheader("🏢 Company Size (Apollo Only)")
+                company_sizes = st.multiselect(
+                    "Select company size ranges:",
+                    [
+                        "1,10", "11,20", "21,50", "51,100", "101,200", "201,500", "501,1000"
+                    ],
+                    default=["1,10", "11,20", "21,50", "51,100"]
+                )
+            except:
+                pass
             
             # Submit button
             submit_button = st.form_submit_button("🚀 Generate Leads")
         
         if submit_button:
-            # Create query from selections
-            job_titles = preset_titles.copy()
-            if custom_title:
-                job_titles.append(custom_title)
-            
-            locations = preset_locations.copy()
-            if custom_location:
-                locations.append(custom_location)
-            
-            industries = preset_industries.copy()
-            if custom_industry:
-                industries.append(custom_industry)
+            # Create query from selections - single values only
+            job_title = custom_title if custom_title else (preset_title if preset_title != "-- Select from list --" else "")
+            location = custom_location if custom_location else (preset_location if preset_location != "-- Select from list --" else "")
+            industry = custom_industry if custom_industry else (preset_industry if preset_industry != "-- Select from list --" else "")
             
             # Check if we have enough info to proceed
-            if not job_titles or not locations or not industries:
-                st.error("Please provide at least one job title, one location, and one industry.")
+            if not job_title or not location or not industry:
+                st.error("Please provide a job title, location, and industry.")
                 return
             
-            # Format for the query
-            formatted_job_titles = [title.replace(" ", "+") for title in job_titles]
-            formatted_locations = [location.replace(" ", "+") for location in locations]
-            formatted_industries = [industry.replace(" ", "+") for industry in industries]
+            # Format for the query - single values in lists for compatibility
+            formatted_job_titles = [job_title.replace(" ", "+")]
+            formatted_locations = [location.replace(" ", "+")]
+            formatted_industries = [industry.replace(" ", "+")]
             
             # Ensure company sizes are in the correct format (already in comma format)
             formatted_company_sizes = company_sizes
             
-            # Create query JSON
+            # Create query JSON from form data
             query_json = json.dumps({
                 "query": [{
                     "job_title": formatted_job_titles,
@@ -2470,12 +2782,10 @@ def lead_generation_page():
                     "employee_ranges": formatted_company_sizes
                 }]
             })
+            method_param = "apollo" if method == "Apollo.io" else "google_search"
             
             # Create a scraping tool instance
             scraping_tool = LeadScrapingTool(APIFY_API_TOKENS, sheets_service, GOOGLE_API_KEY, GOOGLE_CSE_ID)
-            
-            # Determine method parameter
-            method_param = "apollo" if method == "Apollo.io" else "google_search"
             
             # Check if required credentials are available for the selected method
             if method_param == "google_search" and (not GOOGLE_API_KEY or not GOOGLE_CSE_ID):
@@ -2486,11 +2796,921 @@ def lead_generation_page():
             method_display = "Apollo.io" if method_param == "apollo" else "Google Search + Apify"
             with st.spinner(f"🔍 Generating leads using {method_display}..."):
                 try:
-                    result = scraping_tool.scrape_leads(query_json, method=method_param)
+                    # Store generation timestamp in session state
+                    generation_timestamp = datetime.now().isoformat()
+                    st.session_state['last_generation_timestamp'] = generation_timestamp
+                    
+                    result = scraping_tool.scrape_leads(query_json, method=method_param, num_results=leads_per_query)
                     st.success("✅ Lead generation completed!")
                     st.markdown(result)
+                    
+                    # Display leads immediately after generation
+                    st.markdown("---")
+                    display_generated_leads()
+                    
                 except Exception as e:
                     st.error(f"❌ Error generating leads: {str(e)}")
+
+def get_supabase_client():
+    """Initialize and return Supabase client."""
+    try:
+        from supabase import create_client
+        supabase_url = st.secrets["SUPABASE_URL"]
+        supabase_key = st.secrets["SUPABASE_SERVICE_ROLE_KEY"]
+        return create_client(supabase_url, supabase_key)
+    except Exception as e:
+        st.error(f"Error initializing Supabase client: {str(e)}")
+        return None
+
+def display_generated_leads():
+    """Display newly generated leads from current session in table format with email management."""
+    
+    # Email modal function for generated leads
+    @st.dialog("📧 Email Management")
+    def email_modal(lead_name, lead_title, lead_company, lead_email, lead_first_name, lead_data):
+        st.markdown(f"### 📧 Email for {lead_name}")
+        
+        # Lead information display
+        col1, col2 = st.columns(2)
+        with col1:
+            st.markdown(f"**Lead:** {lead_name} ({lead_title})")
+        with col2:
+            st.markdown(f"**Company:** {lead_company}")
+        
+        # Email status tracking
+        email_key = f"email_sent_{lead_data.get('id', '')}"
+        
+        if st.session_state.get(email_key, False):
+            st.success("✅ Email already sent to this lead")
+            if st.button("📧 Send Another Email", key="resend_email"):
+                st.session_state[email_key] = False
+                st.rerun()
+        
+        # Email composition form
+        st.markdown("#### ✍️ Compose Email")
+        
+        # Template selection
+        template_col1, template_col2 = st.columns([1, 1])
+        with template_col1:
+            persona = st.selectbox(
+                "Select Persona",
+                ["operations_manager", "facility_manager", "maintenance_manager", "plant_manager"],
+                key="email_persona"
+            )
+        with template_col2:
+            stage = st.selectbox(
+                "Email Stage",
+                ["initial_outreach", "follow_up", "meeting_request"],
+                key="email_stage"
+            )
+        
+        # Template and save buttons
+        btn_col1, btn_col2 = st.columns([1, 1])
+        with btn_col1:
+            if st.button("🔄 Use Template", key="use_template"):
+                with st.spinner("Generating from template..."):
+                    try:
+                        template_manager = SimpleEmailManager()
+                        templates = asyncio.run(template_manager.retrieve_templates(persona, stage))
+                        if templates:
+                            # Convert lead data to expected format
+                            lead_data_formatted = {
+                                'fullName': lead_name,
+                                'firstName': lead_first_name,
+                                'jobTitle': lead_title,
+                                'companyName': lead_company,
+                                'email': lead_email
+                            }
+                            result = asyncio.run(template_manager.generate_email(lead_data_formatted, templates))
+                            if result["status"] == "success":
+                                st.session_state["email_subject"] = result["subject"]
+                                st.session_state["email_body"] = result["body"]
+                                st.success("✅ Email generated from templates!")
+                                st.rerun()
+                            else:
+                                st.error(f"Failed to generate email: {result['message']}")
+                        else:
+                            st.warning("No templates found for this persona and stage")
+                    except Exception as e:
+                        st.error(f"Error using template: {str(e)}")
+        
+        with btn_col2:
+            if st.button("💾 Save as Template", key="save_template"):
+                with st.spinner("Saving email as template..."):
+                    try:
+                        template_manager = SimpleEmailManager()
+                        draft_result = asyncio.run(template_manager.save_draft(
+                            lead_id=lead_data.get('id', ''),
+                            subject=st.session_state.get("email_subject", ""),
+                            body=st.session_state.get("email_body", ""),
+                            persona=persona,
+                            stage=stage
+                        ))
+                        
+                        if draft_result["status"] == "success":
+                            # Mark as template
+                            template_result = asyncio.run(template_manager.mark_as_template(
+                                draft_id=draft_result["data"]["id"],
+                                persona=persona,
+                                stage=stage
+                            ))
+                            
+                            if template_result["status"] == "success":
+                                st.success("✅ Saved as template for future use!")
+                            else:
+                                st.error(f"Failed to mark as template: {template_result['message']}")
+                        else:
+                            st.error(f"Failed to save email: {draft_result['message']}")
+                    except Exception as e:
+                        st.error(f"Error saving email: {str(e)}")
+        
+        # Email composition fields
+        subject = st.text_input(
+            "Subject", 
+            value=st.session_state.get("email_subject", f"Quick question about {lead_company}"),
+            key="email_subject"
+        )
+        
+        # Default email template
+        default_template = f"""Hi {lead_first_name},
+
+I noticed your role as {lead_title} at {lead_company}.
+
+[Your personalized message here]
+
+Best regards,
+[Your name]"""
+        
+        email_body = st.text_area(
+            "Body", 
+            value=st.session_state.get("email_body", default_template),
+            height=200,
+            key="email_body"
+        )
+        
+        # Send and close buttons
+        btn_col1, btn_col2 = st.columns([1, 1])
+        with btn_col1:
+            if st.button("📤 Send Email", key="send_email", type="primary"):
+                with st.spinner("Sending email..."):
+                    email_manager = EmailManager(RESEND_API_KEY, "resend.dev", SENDER_EMAIL)
+                    result = email_manager.send_email(
+                        lead_email,
+                        subject,
+                        email_body
+                    )
+                    
+                    if result["status"] == "success":
+                        st.success("✅ Email sent successfully!")
+                        # Mark as sent in session state
+                        st.session_state[email_key] = True
+                        
+                        # Update lead status in database
+                        try:
+                            supabase_client = get_supabase_client()
+                            supabase_client.table("leads").update({
+                                "send_email_status": "Sent"
+                            }).eq("id", lead_data.get('id')).execute()
+                        except Exception as e:
+                            st.warning(f"Could not update email status in database: {str(e)}")
+                        
+                        # Clear email content from session state
+                        if "email_subject" in st.session_state:
+                            del st.session_state["email_subject"]
+                        if "email_body" in st.session_state:
+                            del st.session_state["email_body"]
+                        
+                        st.rerun()
+                    else:
+                        st.error(f"Failed to send email: {result['message']}")
+        
+        with btn_col2:
+            if st.button("❌ Close", key="close_email"):
+                # Clear email content from session state
+                if "email_subject" in st.session_state:
+                    del st.session_state["email_subject"]
+                if "email_body" in st.session_state:
+                    del st.session_state["email_body"]
+                st.rerun()
+    
+    st.subheader("📊 Generated Leads")
+    st.markdown("View and manage your newly generated leads")
+    
+    # Check if there's a generation timestamp in session state
+    if 'last_generation_timestamp' not in st.session_state:
+        st.info("No leads generated in this session yet. Generate some leads first!")
+        return
+    
+    # Initialize Supabase client
+    try:
+        supabase_client = get_supabase_client()
+        if not supabase_client:
+            st.error("❌ Supabase client not initialized. Cannot display leads.")
+            return
+    except Exception as e:
+        st.error(f"❌ Error connecting to Supabase: {str(e)}")
+        return
+    
+    # Initialize email manager
+    email_manager = EmailManager(RESEND_API_KEY, "resend.dev", SENDER_EMAIL)
+    
+    try:
+        # Get leads created after the last generation timestamp
+        generation_timestamp = st.session_state['last_generation_timestamp']
+        response = supabase_client.table("leads").select("*").gte("created_at", generation_timestamp).order("created_at", desc=True).execute()
+        
+        if not response.data:
+            st.info("No newly generated leads found. Generate some leads first!")
+            return
+        
+        leads_data = response.data
+        total_leads = len(leads_data)
+        
+        # Display metrics
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            st.metric("Generated Leads", total_leads)
+        with col2:
+            # Count leads with emails
+            leads_with_email = sum(1 for lead in leads_data if lead.get('email') or lead.get('email_address'))
+            st.metric("Leads with Email", leads_with_email)
+        with col3:
+            # Average ICP score
+            icp_scores = [float(lead.get('icp_percentage', 0)) for lead in leads_data if lead.get('icp_percentage')]
+            avg_icp = sum(icp_scores) / len(icp_scores) if icp_scores else 0
+            st.metric("Avg ICP Score", f"{avg_icp:.1f}%")
+        
+        st.markdown("---")
+        
+        # Convert to DataFrame for easier manipulation
+        leads_df = pd.DataFrame(leads_data)
+        
+        # Display all leads without filters
+        filtered_df = leads_df.copy()
+        
+        # Display results count
+        st.info(f"📊 Showing {len(filtered_df)} generated leads")
+        
+        if filtered_df.empty:
+            st.warning("No leads found.")
+            return
+        
+        # Display leads in table format
+        st.subheader("📋 Generated Leads Table")
+        st.info("💡 To manage and filter your generated leads, go to the **Leads Database** page")
+        
+        # Table headers
+        # header_cols = st.columns([2.5, 2, 2, 1.5, 1.5, 1, 1.5])
+        header_cols = st.columns([2.5, 2, 2, 1.5, 1.5, 1])
+        with header_cols[0]:
+            st.markdown("**👤 Name & Title**")
+        with header_cols[1]:
+            st.markdown("**🏢 Company**")
+        with header_cols[2]:
+            st.markdown("**📧 Email**")
+        with header_cols[3]:
+            st.markdown("**📍 Location**")
+        with header_cols[4]:
+            st.markdown("**📱 Social Media**")
+        with header_cols[5]:
+            st.markdown("**🎯 ICP**")
+        # with header_cols[6]:
+        #     st.markdown("**⚡ Actions**")
+        
+        st.markdown("---")
+        
+        # Display each lead as a table row
+        for lead_idx, lead in filtered_df.iterrows():
+            # Handle different field naming conventions
+            name = lead.get('full_name') or lead.get('fullName', 'Unknown')
+            first_name = lead.get('first_name') or lead.get('firstName', name.split()[0] if name != 'Unknown' else '')
+            title = lead.get('job_title') or lead.get('jobTitle', 'Unknown Title')
+            company = lead.get('company_name') or lead.get('companyName', 'Unknown Company')
+            industry = lead.get('company_industry') or lead.get('companyIndustry', 'Unknown Industry')
+            linkedin_url = lead.get('linkedin_url', '')
+            email = lead.get('email') or lead.get('email_address', 'No email')
+            
+            # Location
+            location_parts = []
+            if lead.get('city'):
+                location_parts.append(str(lead.get('city')))
+            if lead.get('state'):
+                location_parts.append(str(lead.get('state')))
+            if lead.get('country'):
+                location_parts.append(str(lead.get('country')))
+            location = ', '.join(location_parts) if location_parts else 'N/A'
+            
+            # ICP Score
+            icp_score = lead.get('icp_percentage') or lead.get('icp_score', 0)
+            icp_grade = lead.get('icp_grade', 'N/A')
+            
+            # Create table row
+            row_cols = st.columns([2.5, 2, 2, 1.5, 1.5, 1, 1.5])
+            
+            with row_cols[0]:
+                # Create name with LinkedIn link
+                if linkedin_url:
+                    st.markdown(f"**[{name}]({linkedin_url})**")
+                else:
+                    st.markdown(f"**{name}**")
+                st.caption(title)
+            
+            with row_cols[1]:
+                # Create company with LinkedIn and website links
+                company_links = []
+                
+                # Add company LinkedIn URL if available
+                company_linkedin = lead.get('company_linkedin') or lead.get('companyLinkedin')
+                if company_linkedin:
+                    if not company_linkedin.startswith(('http://', 'https://')):
+                        company_linkedin = f"https://{company_linkedin}"
+                    company_links.append(f"[{company}]({company_linkedin})")
+                else:
+                    company_links.append(company)
+                
+                st.markdown(" ".join(company_links))
+                
+                # Show website as caption if available
+                company_website = lead.get('company_website') or lead.get('companyWebsite', '')
+                if company_website:
+                    if not company_website.startswith(('http://', 'https://')):
+                        company_website = f"https://{company_website}"
+                    st.caption(f"🌐 [Website]({company_website})")
+                else:
+                    st.caption(industry)
+            
+            with row_cols[2]:
+                if email and email != 'No email':
+                    st.markdown(f"📧 {email}")
+                else:
+                    st.write("N/A")
+            
+            with row_cols[3]:
+                st.write(location)
+            
+            with row_cols[4]:
+                # Social Media links
+                social_links = []
+                twitter = lead.get('company_twitter', '')
+                facebook = lead.get('company_facebook', '')
+                
+                if twitter:
+                    if not twitter.startswith(('http://', 'https://')):
+                        twitter = f"https://{twitter}"
+                    social_links.append(f"[🐦]({twitter})")
+                if facebook:
+                    if not facebook.startswith(('http://', 'https://')):
+                        facebook = f"https://{facebook}"
+                    social_links.append(f"[📘]({facebook})")
+                
+                if social_links:
+                    st.markdown(" ".join(social_links))
+                else:
+                    st.write("N/A")
+            
+            with row_cols[5]:
+                if icp_score and float(icp_score) > 0:
+                    score = float(icp_score)
+                    if score >= 80:
+                        st.markdown(f"🟢 **{score:.0f}%**")
+                    elif score >= 60:
+                        st.markdown(f"🟡 **{score:.0f}%**")
+                    else:
+                        st.markdown(f"🔴 **{score:.0f}%**")
+                    st.caption(f"Grade: {icp_grade}")
+                else:
+                    st.write("N/A")
+            
+            with row_cols[6]:
+                # Email management button
+                if email and email != 'No email':
+                    email_key = f"email_modal_{lead.get('id', lead_idx)}"
+                    if st.button("📧 Email", key=f"email_btn_{lead_idx}", help="Manage email for this lead"):
+                        st.session_state[email_key] = True
+                        st.session_state[f"current_lead_name_{lead_idx}"] = name
+                        st.session_state[f"current_lead_title_{lead_idx}"] = title
+                        st.session_state[f"current_lead_company_{lead_idx}"] = company
+                        st.session_state[f"current_lead_email_{lead_idx}"] = email
+                        st.session_state[f"current_lead_first_name_{lead_idx}"] = first_name
+                        st.session_state[f"current_lead_data_{lead_idx}"] = lead
+                else:
+                    st.caption("No email")
+            
+            # Add separator between rows
+            if lead_idx < len(filtered_df) - 1:
+                st.markdown("<hr style='margin: 0.5rem 0; border: 1px solid #e0e0e0;'>", unsafe_allow_html=True)
+    
+    except Exception as e:
+        st.error(f"❌ Error loading leads: {str(e)}")
+    
+    # Handle email modal triggers for generated leads
+    for lead_idx in range(len(filtered_df) if 'filtered_df' in locals() and not filtered_df.empty else 0):
+        email_key = f"email_modal_{filtered_df.iloc[lead_idx].get('id', lead_idx)}"
+        if st.session_state.get(email_key, False):
+            lead_name = st.session_state.get(f"current_lead_name_{lead_idx}", "Unknown")
+            lead_title = st.session_state.get(f"current_lead_title_{lead_idx}", "Unknown Title")
+            lead_company = st.session_state.get(f"current_lead_company_{lead_idx}", "Unknown Company")
+            lead_email = st.session_state.get(f"current_lead_email_{lead_idx}", "")
+            lead_first_name = st.session_state.get(f"current_lead_first_name_{lead_idx}", "")
+            lead_data = st.session_state.get(f"current_lead_data_{lead_idx}", {})
+            
+            email_modal(lead_name, lead_title, lead_company, lead_email, lead_first_name, lead_data)
+            st.session_state[email_key] = False
+
+
+def leads_database_page():
+    """Display all scraped leads from Supabase in table format with email management."""
+    
+    # Define email modal function outside the loop to avoid dialog conflicts
+    @st.dialog("📧 Email Management")
+    def email_modal(name, title, company, email, first_name, lead, lead_idx, email_key):
+        # Display lead info in modal
+        st.markdown(f"**Lead:** {name} ({title})")
+        st.markdown(f"**Company:** {company}")
+        st.markdown(f"**Email:** {email}")
+        st.markdown("---")
+        
+        # Initialize email manager
+        email_manager = EmailManager(RESEND_API_KEY, "resend.dev", SENDER_EMAIL)
+        
+        # Email status tracking
+        sent_key = f"email_sent_{lead.get('id', lead_idx)}"
+        compose_key = f"compose_{sent_key}"
+        
+        if st.session_state.get(sent_key, False):
+            st.success("✅ Email already sent to this lead")
+            if st.button("📧 Send Another Email", key=f"resend_{lead_idx}"):
+                st.session_state[sent_key] = False
+                st.session_state[compose_key] = False
+                st.rerun()
+        else:
+            # Email composition form (show directly)
+            st.markdown("#### 📨 Compose Email")
+            
+            # Template selection
+            template_col1, template_col2 = st.columns([1, 1])
+            with template_col1:
+                persona = st.selectbox(
+                    "Select Persona",
+                    ["operations_manager", "facility_manager", "maintenance_manager", "plant_manager"],
+                    key=f"persona_{lead_idx}"
+                )
+            with template_col2:
+                stage = st.selectbox(
+                    "Email Stage",
+                    ["initial_outreach", "follow_up", "meeting_request"],
+                    key=f"stage_{lead_idx}"
+                )
+            
+            # Template and save buttons
+            btn_col1, btn_col2 = st.columns([1, 1])
+            with btn_col1:
+                if st.button("🔄 Use Template", key=f"template_{lead_idx}"):
+                    with st.spinner("Generating from template..."):
+                        try:
+                            template_manager = SimpleEmailManager()
+                            templates = asyncio.run(template_manager.retrieve_templates(persona, stage))
+                            if templates:
+                                # Convert lead data to expected format
+                                lead_data = {
+                                    'fullName': name,
+                                    'firstName': first_name,
+                                    'jobTitle': title,
+                                    'companyName': company,
+                                    'email': email
+                                }
+                                result = asyncio.run(template_manager.generate_email(lead_data, templates))
+                                if result["status"] == "success":
+                                    st.session_state[f"subject_{lead_idx}"] = result["subject"]
+                                    st.session_state[f"body_{lead_idx}"] = result["body"]
+                                    st.success("✅ Email generated from templates!")
+                                    st.rerun()
+                                else:
+                                    st.error(f"Failed to generate email: {result['message']}")
+                            else:
+                                st.warning("No templates found for this persona and stage")
+                        except Exception as e:
+                            st.error(f"Error using template: {str(e)}")
+            
+            with btn_col2:
+                if st.button("💾 Save Email", key=f"save_{lead_idx}"):
+                    with st.spinner("Saving email..."):
+                        try:
+                            template_manager = SimpleEmailManager()
+                            draft_result = asyncio.run(template_manager.save_draft(
+                                lead_id=lead.get('id', str(lead_idx)),
+                                subject=st.session_state.get(f"subject_{lead_idx}", ""),
+                                body=st.session_state.get(f"body_{lead_idx}", ""),
+                                persona=persona,
+                                stage=stage
+                            ))
+                            
+                            if draft_result["status"] == "success":
+                                # Mark as template
+                                template_result = asyncio.run(template_manager.mark_as_template(
+                                    draft_id=draft_result["data"]["id"],
+                                    persona=persona,
+                                    stage=stage
+                                ))
+                                
+                                if template_result["status"] == "success":
+                                    st.success("✅ Saved as template for future use!")
+                                else:
+                                    st.error(f"Failed to mark as template: {template_result['message']}")
+                            else:
+                                st.error(f"Failed to save email: {draft_result['message']}")
+                        except Exception as e:
+                            st.error(f"Error saving email: {str(e)}")
+            
+            # Email composition fields
+            subject = st.text_input(
+                "Subject", 
+                value=st.session_state.get(f"subject_{lead_idx}", f"Quick question about {company}"), 
+                key=f"subject_{lead_idx}"
+            )
+            
+            # Default email template
+            default_template = f"""Hi {first_name},
+
+I noticed your role as {title} at {company}. 
+
+[Your personalized message here]
+
+Best regards,
+[Your name]"""
+            
+            email_body = st.text_area(
+                "Body", 
+                value=st.session_state.get(f"body_{lead_idx}", default_template),
+                height=200, 
+                key=f"body_{lead_idx}"
+            )
+            
+            # Send email button
+            if st.button("📤 Send Email", key=f"send_{lead_idx}", type="primary"):
+                with st.spinner("Sending email..."):
+                    result = email_manager.send_email(email, subject, email_body)
+                    
+                    if result["status"] == "success":
+                        st.success("✅ Email sent successfully!")
+                        # Mark as sent
+                        st.session_state[sent_key] = True
+                        st.session_state[compose_key] = False
+                        st.session_state[email_key] = False
+                        st.rerun()
+                    else:
+                        st.error(f"Failed to send email: {result['message']}")
+        
+        # Close button
+        if st.button("❌ Close", key=f"close_modal_{lead_idx}"):
+            st.session_state[email_key] = False
+            st.rerun()
+    
+    st.title("📊 Leads Database")
+    st.markdown("View and manage all scraped leads from the database")
+    
+    # Initialize Supabase client
+    try:
+        supabase_client = get_supabase_client()
+        if not supabase_client:
+            st.error("❌ Supabase client not initialized. Cannot display leads database.")
+            return
+    except Exception as e:
+        st.error(f"❌ Error connecting to Supabase: {str(e)}")
+        return
+    
+    # Initialize email manager
+    email_manager = EmailManager(RESEND_API_KEY, "resend.dev", SENDER_EMAIL)
+    
+    try:
+        # Get total leads count
+        leads_result = supabase_client.table("leads") \
+            .select("*") \
+            .order("created_at", desc=True) \
+            .execute()
+            
+        if not leads_result.data:
+            st.info("No leads found in the database.")
+            return
+            
+        total_leads = len(leads_result.data)
+        
+        # Display metrics
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            st.metric("Total Leads", total_leads)
+        with col2:
+            # Count leads with emails
+            leads_with_email = sum(1 for lead in leads_result.data if lead.get('email') or lead.get('email_address'))
+            st.metric("Leads with Email", leads_with_email)
+        with col3:
+            # Average ICP score
+            icp_scores = [float(lead.get('icp_percentage', 0)) for lead in leads_result.data if lead.get('icp_percentage')]
+            avg_icp = sum(icp_scores) / len(icp_scores) if icp_scores else 0
+            st.metric("Avg ICP Score", f"{avg_icp:.1f}%")
+        
+        st.markdown("---")
+        
+        # Convert to DataFrame for easier manipulation
+        leads_df = pd.DataFrame(leads_result.data)
+        
+        # Add filters and sorting
+        col1, col2, col3, col4, col5, col6 = st.columns(6)
+        
+        with col1:
+            # ICP Score filter
+            min_icp = st.slider(
+                "Min ICP Score",
+                min_value=0,
+                max_value=100,
+                value=0,
+                key="icp_filter"
+            )
+        
+        with col2:
+            # Company filter
+            companies = ["All"] + sorted(leads_df['company_name'].dropna().unique().tolist())
+            company_filter = st.selectbox(
+                "Company",
+                options=companies,
+                key="company_filter"
+            )
+        
+        with col3:
+            # Job title filter
+            job_titles = ["All"] + sorted(leads_df['job_title'].dropna().unique().tolist())
+            job_filter = st.selectbox(
+                "Job Title",
+                options=job_titles,
+                key="job_filter"
+            )
+        
+        with col4:
+            # Email availability filter
+            email_availability_filter = st.selectbox(
+                "Email Availability",
+                options=["All", "With Email", "Without Email"],
+                index=1,  # Default to "With Email"
+                key="email_availability_filter"
+            )
+        
+        with col5:
+            # Email status filter
+            email_status_filter = st.selectbox(
+                "Email Status",
+                options=["All", "Sent", "Not Sent"],
+                index=0,
+                key="email_status_filter"
+            )
+        
+        with col6:
+            # Sort by filter
+            sort_options = {
+                "Newest First": ("created_at", False),
+                "Oldest First": ("created_at", True),
+                "Name A-Z": ("full_name", True),
+                "Name Z-A": ("full_name", False),
+                "Company A-Z": ("company_name", True),
+                "Company Z-A": ("company_name", False),
+                "ICP Score High-Low": ("icp_percentage", False),
+                "ICP Score Low-High": ("icp_percentage", True)
+            }
+            sort_filter = st.selectbox(
+                "Sort By",
+                options=list(sort_options.keys()),
+                index=0,
+                key="sort_filter"
+            )
+        
+        # Apply filters
+        filtered_df = leads_df.copy()
+        
+        # Filter by ICP score
+        if 'icp_percentage' in filtered_df.columns:
+            filtered_df['icp_percentage'] = pd.to_numeric(filtered_df['icp_percentage'], errors='coerce')
+            filtered_df = filtered_df[filtered_df['icp_percentage'].notna() & (filtered_df['icp_percentage'] >= min_icp)]
+        
+        # Filter by company
+        if company_filter != "All":
+            filtered_df = filtered_df[filtered_df['company_name'] == company_filter]
+        
+        # Filter by job title
+        if job_filter != "All":
+            filtered_df = filtered_df[filtered_df['job_title'] == job_filter]
+        
+        # Helper functions for email validation
+        def has_valid_email(lead):
+            try:
+                email = lead.get('email') or lead.get('email_address', '')
+                if pd.isna(email) or email is None:
+                    return False
+                email_str = str(email).strip()
+                return email_str and email_str != 'No email' and email_str != 'nan' and '@' in email_str
+            except:
+                return False
+        
+        def has_no_valid_email(lead):
+            return not has_valid_email(lead)
+        
+        # Filter by email availability
+        if email_availability_filter == "With Email":
+            email_mask = filtered_df.apply(has_valid_email, axis=1)
+            # Handle any NaN values in the mask
+            email_mask = email_mask.fillna(False)
+            filtered_df = filtered_df[email_mask]
+        elif email_availability_filter == "Without Email":
+            email_mask = filtered_df.apply(has_no_valid_email, axis=1)
+            # Handle any NaN values in the mask
+            email_mask = email_mask.fillna(True)
+            filtered_df = filtered_df[email_mask]
+        
+        # Filter by email status
+        if email_status_filter != "All":
+            if email_status_filter == "Sent":
+                # Filter for leads that have been sent emails (check session state)
+                sent_leads = []
+                for _, lead in filtered_df.iterrows():
+                    sent_key = f"email_sent_{lead.get('id', '')}"
+                    if st.session_state.get(sent_key, False):
+                        sent_leads.append(lead.name)
+                if sent_leads:
+                    filtered_df = filtered_df.loc[sent_leads]
+                else:
+                    filtered_df = filtered_df.iloc[0:0]  # Empty dataframe
+            elif email_status_filter == "Not Sent":
+                # Filter for leads that have NOT been sent emails
+                not_sent_leads = []
+                for _, lead in filtered_df.iterrows():
+                    sent_key = f"email_sent_{lead.get('id', '')}"
+                    if not st.session_state.get(sent_key, False):
+                        not_sent_leads.append(lead.name)
+                if not_sent_leads:
+                    filtered_df = filtered_df.loc[not_sent_leads]
+                else:
+                    filtered_df = filtered_df.iloc[0:0]  # Empty dataframe
+        
+        # Display filtered results count
+        st.info(f"📊 Showing {len(filtered_df)} of {len(leads_df)} leads")
+        
+        if filtered_df.empty:
+            st.warning("No leads match your current filters.")
+        else:
+            # Display leads in table format
+            st.subheader("📋 Leads Table")
+            
+            # Create table headers
+            header_cols = st.columns([2.5, 2, 2, 1.5, 1.5, 1, 1.5])
+            with header_cols[0]:
+                st.markdown("**👤 Name & Title**")
+            with header_cols[1]:
+                st.markdown("**🏢 Company**")
+            with header_cols[2]:
+                st.markdown("**📧 Email**")
+            with header_cols[3]:
+                st.markdown("**📍 Location**")
+            with header_cols[4]:
+                st.markdown("**📱 Social Media**")
+            with header_cols[5]:
+                st.markdown("**🎯 ICP**")
+            with header_cols[6]:
+                st.markdown("**⚡ Actions**")
+            
+            st.markdown("---")
+            
+            # Display each lead as a table row
+            for lead_idx, lead in filtered_df.iterrows():
+                # Handle different field naming conventions
+                name = lead.get('full_name') or lead.get('fullName', 'Unknown')
+                first_name = lead.get('first_name') or lead.get('firstName', name.split()[0] if name != 'Unknown' else '')
+                title = lead.get('job_title') or lead.get('jobTitle', 'Unknown Title')
+                company = lead.get('company_name') or lead.get('companyName', 'Unknown Company')
+                industry = lead.get('company_industry') or lead.get('companyIndustry', 'Unknown Industry')
+                linkedin_url = lead.get('linkedin_url', '')
+                email = lead.get('email') or lead.get('email_address', 'No email')
+                
+                # Location
+                location_parts = []
+                if lead.get('city'):
+                    location_parts.append(str(lead.get('city')))
+                if lead.get('state'):
+                    location_parts.append(str(lead.get('state')))
+                if lead.get('country'):
+                    location_parts.append(str(lead.get('country')))
+                location = ', '.join(location_parts) if location_parts else 'N/A'
+                
+                # ICP Score
+                icp_score = lead.get('icp_percentage') or lead.get('icp_score', 0)
+                icp_grade = lead.get('icp_grade', 'N/A')
+                
+                # Create table row
+                row_cols = st.columns([2.5, 2, 2, 1.5, 1.5, 1, 1.5])
+                
+                with row_cols[0]:
+                     # Create name with LinkedIn link
+                     if linkedin_url:
+                         st.markdown(f"**[{name}]({linkedin_url})**")
+                     else:
+                         st.markdown(f"**{name}**")
+                     st.caption(title)
+                
+                with row_cols[1]:
+                    # Create company with LinkedIn and website links
+                    company_links = []
+                    
+                    # Add company LinkedIn URL if available
+                    company_linkedin = lead.get('company_linkedin') or lead.get('companyLinkedin')
+                    if company_linkedin:
+                        if not company_linkedin.startswith(('http://', 'https://')):
+                            company_linkedin = f"https://{company_linkedin}"
+                        company_links.append(f"[{company}]({company_linkedin})")
+                    else:
+                        company_links.append(company)
+                    
+                    # Add company website link if available
+                    company_website = lead.get('company_website') or lead.get('companyWebsite')
+                    if company_website:
+                        if not company_website.startswith(('http://', 'https://')):
+                            company_website = f"https://{company_website}"
+                        company_links.append(f"[🌐]({company_website})")
+                    
+                    st.markdown(f"**{' '.join(company_links)}**")
+                    st.caption(industry)
+                
+                with row_cols[2]:
+                    if email and email != 'No email':
+                        st.markdown(f"📧 {email}")
+                    else:
+                        st.caption("No email")
+                
+                with row_cols[3]:
+                    st.caption(location)
+                
+                with row_cols[4]:
+                    # Social Media Links
+                    social_links = []
+                    
+                    # Add Twitter link if available
+                    company_twitter = lead.get('company_twitter') or lead.get('companyTwitter')
+                    if company_twitter:
+                        if not company_twitter.startswith(('http://', 'https://')):
+                            company_twitter = f"https://twitter.com/{company_twitter.lstrip('@')}"
+                        social_links.append(f"[🐦]({company_twitter})")
+                    
+                    # Add Facebook link if available
+                    company_facebook = lead.get('company_facebook') or lead.get('companyFacebook')
+                    if company_facebook:
+                        if not company_facebook.startswith(('http://', 'https://')):
+                            company_facebook = f"https://facebook.com/{company_facebook}"
+                        social_links.append(f"[📘]({company_facebook})")
+                    
+                    if social_links:
+                        st.markdown(' '.join(social_links))
+                    else:
+                        st.caption("No social media")
+                
+                with row_cols[5]:
+                    if icp_score >= 80:
+                        st.success(f"{icp_score}%")
+                    elif icp_score >= 60:
+                        st.warning(f"{icp_score}%")
+                    else:
+                        st.info(f"{icp_score}%")
+                    st.caption(icp_grade)
+                
+                with row_cols[6]:
+                    # Email management button
+                    if email and email != 'No email':
+                        email_key = f"email_modal_{lead.get('id', lead_idx)}"
+                        if st.button("📧 Email", key=f"email_btn_{lead_idx}", help="Manage email for this lead"):
+                            st.session_state[email_key] = True
+                            st.session_state[f"current_lead_name_{lead_idx}"] = name
+                            st.session_state[f"current_lead_title_{lead_idx}"] = title
+                            st.session_state[f"current_lead_company_{lead_idx}"] = company
+                            st.session_state[f"current_lead_email_{lead_idx}"] = email
+                            st.session_state[f"current_lead_first_name_{lead_idx}"] = first_name
+                            st.session_state[f"current_lead_data_{lead_idx}"] = lead
+                        
+                        # Email management modal
+                        if st.session_state.get(email_key, False):
+                            # Get stored lead data
+                            stored_name = st.session_state.get(f"current_lead_name_{lead_idx}", name)
+                            stored_title = st.session_state.get(f"current_lead_title_{lead_idx}", title)
+                            stored_company = st.session_state.get(f"current_lead_company_{lead_idx}", company)
+                            stored_email = st.session_state.get(f"current_lead_email_{lead_idx}", email)
+                            stored_first_name = st.session_state.get(f"current_lead_first_name_{lead_idx}", first_name)
+                            stored_lead = st.session_state.get(f"current_lead_data_{lead_idx}", lead)
+                            
+                            email_modal(stored_name, stored_title, stored_company, stored_email, stored_first_name, stored_lead, lead_idx, email_key)
+                    else:
+                        st.caption("No email")
+                
+                # Add separator between rows
+                if lead_idx < len(filtered_df) - 1:
+                    st.markdown("---")
+                    
+    except Exception as e:
+        st.error(f"⚠️ Error fetching data from database: {str(e)}")
+
 
 if __name__ == "__main__":
     main()
